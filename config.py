@@ -7,14 +7,19 @@ PERF_FLAGS = (
     "uint8_images", "fused_adamw", "ddp_static_graph",
 )
 
+EXTRA_PERF_FLAGS = ("fp8",) # accepted by name, not part of "all" (FP8 changes numerics and needs a capability >= 8.9 GPU)
+
 def parse_perf_flags(spec: str) -> dict:
-    """ --perf value ("a,b" or "all") -> {"perf_a": True, "perf_b": True} """
-    names = [n.strip() for n in (spec or "").split(",") if n.strip()]
-    if names == ["all"]:
-        names = list(PERF_FLAGS)
-    unknown = [n for n in names if n not in PERF_FLAGS]
+    """ --perf value ("a,b", "all", or e.g. "all,fp8") -> {"perf_a": True, "perf_b": True} """
+    names = []
+    for n in (n.strip() for n in (spec or "").split(",")):
+        if n == "all":
+            names += PERF_FLAGS
+        elif n:
+            names.append(n)
+    unknown = [n for n in names if n not in PERF_FLAGS + EXTRA_PERF_FLAGS]
     if unknown:
-        raise ValueError(f"unknown --perf flags {unknown}; choose from {list(PERF_FLAGS)} or 'all'")
+        raise ValueError(f"unknown --perf flags {unknown}; choose from {list(PERF_FLAGS + EXTRA_PERF_FLAGS)} or 'all'")
     return {f"perf_{n}": True for n in names}
 
 def _grad_accum_steps(global_batch_size: int, batch_size: int, world_size: int) -> int:
@@ -104,6 +109,7 @@ class PretrainConfig:
     perf_uint8_images: bool = False # uint8 images from pinned memory, normalized on the GPU
     perf_fused_adamw: bool = False # AdamW(fused=True)
     perf_ddp_static_graph: bool = False # DDP static_graph=True (multi-GPU only)
+    perf_fp8: bool = False # torchao float8 training for the Linear layers (GPU capability >= 8.9; not bit-exact)
 
     # Derived attributes
     def __post_init__(self):

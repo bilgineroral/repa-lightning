@@ -12,11 +12,12 @@ flags off the code behaves exactly as before.
 | `uint8_images` | The dataloader returns uint8 images from pinned memory; `x / 255` and `Normalize` run on the GPU (bit-identical inputs). | `perf_uint8_images` |
 | `fused_adamw` | `AdamW(fused=True)`. Lightning refuses to clip gradients for fused optimizers under AMP, so `LitREPA.configure_gradient_clipping` runs the same `clip_grad_norm_` itself. bf16 and fp32 only. | `perf_fused_adamw` |
 | `ddp_static_graph` | `DDPStrategy(static_graph=True)`. Multi-GPU only; does nothing on one GPU. | `perf_ddp_static_graph` |
+| `fp8` (Tier 2, not in `all`) | torchao float8 training for every `nn.Linear` (default dynamic tensorwise recipe). Needs compute capability >= 8.9 (Ada / Hopper) and refuses otherwise. **Not bit-exact**: the test checks the loss stays within 5% of bf16 over 20 steps. Use `--perf all,fp8`. | `perf_fp8` |
 
 Training with flags: `python pretrain.py --model small --data-root <root> --perf all`
 (or a comma list, e.g. `--perf skip_last_content,causal_no_mask`).
 
-The model and loss are unchanged: same parameters, same checkpoints, and old checkpoints still load. The tests
+Except for `fp8`, the model and loss are unchanged: same parameters, same checkpoints, and old checkpoints still load. The tests
 check equal loss and gradients. Equality is exact up to float rounding only with drop path 0 (the default). With
 drop path, `skip_last_content` changes the order of random draws.
 
@@ -62,6 +63,8 @@ DATA_ROOT=$HOME/imagenet bash bench/launch.sh
    Gradient accumulation is set to keep the config's global batch of 4096.
 4. the Tier 1 matrix: baseline, each flag and all flags, for synthetic and real data
 5. profiles of baseline vs all flags
+6. FP8 runs (`--perf fp8` and `all,fp8`), only if preflight found compute capability >= 8.9; otherwise skipped with
+   a message
 
 Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_all.log`), the
 preflight JSON, the chosen batch sizes (`batch_sizes.txt`), one JSON per run, profiles and Chrome traces. A failed
@@ -128,3 +131,7 @@ MODELS=S STEPS=10 WARMUP=5 DATA_ROOT=~/repa_fake bash bench/launch.sh
 ```
 
 The fake JPEGs have realistic sizes, so decode cost is similar, but the content is random noise.
+
+## Tier 3
+
+Custom-kernel plans (not implemented): `bench/TIER3.md`.

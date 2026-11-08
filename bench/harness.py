@@ -153,5 +153,6 @@ def environment():
 
 def run_tag(args, flags):
     gpu = torch.cuda.get_device_name(0).replace("NVIDIA ", "").replace(" ", "-")
-    name = "all" if set(flags) == set(PERF_FLAGS) else ("+".join(flags) or "baseline")
+    rest = [f for f in flags if f not in PERF_FLAGS]
+    name = "+".join(["all"] + rest) if set(PERF_FLAGS) <= set(flags) else ("+".join(flags) or "baseline")
     return f"{args.model}_{args.data}_{name}_b{args.batch}_{gpu}_{time.strftime('%Y%m%d-%H%M%S')}"

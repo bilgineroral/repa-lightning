@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EMAWeightAveraging, Ear
 from pytorch_lightning.utilities import rank_zero_only
 
 from dataset import PretrainDataset, ImageNetDataModule
-from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
+from config import EXTRA_PERF_FLAGS, PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
 from repa import LitREPA
 
 torch.serialization.add_safe_globals([PretrainConfig, PretrainConfigSmall]) # configs are pickled into checkpoints
@@ -48,7 +48,7 @@ def main():
     p.add_argument("--use-permutation", type=int, choices=[0, 1], default=None, help="Use permutation sampling (1) or next-token sampling (0)")
     p.add_argument("--use-query-stream", type=int, choices=[0, 1], default=None, help="Predict with the query stream (1) or, as NEPA, from the content stream (0, needs --use-permutation 0)")
     p.add_argument("--model", type=str, choices=["base", "small"], default="base", help="ViT-B/16 (base) or ViT-S/16 (small) recipe")
-    p.add_argument("--perf", type=str, default="", help=f"Speed flags, comma separated, or 'all' (default: none): {', '.join(PERF_FLAGS)}")
+    p.add_argument("--perf", type=str, default="", help=f"Speed flags, comma separated, or 'all' (default: none): {', '.join(PERF_FLAGS)}; also {', '.join(EXTRA_PERF_FLAGS)} (not in 'all')")
     args = p.parse_args()
 
     Config = {"base": PretrainConfig, "small": PretrainConfigSmall}[args.model]

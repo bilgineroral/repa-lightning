@@ -27,11 +27,29 @@ def prediction_loss(tgt, pred, s=None, sync_free: bool = False):
         return (loss * weight).sum() / weight.sum()
     return loss[include].mean()
 
+def fp8_supported() -> bool:
+    """ torchao float8 training needs FP8 tensor cores: compute capability >= 8.9 (Ada, Hopper or newer) """
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+
+def convert_to_fp8(model):
+    """ perf_fp8: swap nn.Linear for torchao's Float8Linear (its default recipe: dynamic tensorwise scaling). FP8 GEMMs
+    need both matrix dims divisible by 16; the patch embedding is a Conv2d and stays bf16. Parameter names and
+    checkpoints are unchanged. """
+    from torchao.float8 import convert_to_float8_training
+    return convert_to_float8_training(
+        model, module_filter_fn=lambda m, fqn: isinstance(m, torch.nn.Linear) and m.in_features % 16 == 0 and m.out_features % 16 == 0
+    )
+
 class LitREPA(pl.LightningModule):
     def __init__(self, config: PretrainConfig):
         super().__init__()
         self.save_hyperparameters(logger=False) # pretrain.py logs the config to W&B field by field
         model = REPA(config)
+        if getattr(config, "perf_fp8", False): # before torch.compile, as torchao requires
+            if not fp8_supported():
+                cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+                raise RuntimeError(f"perf_fp8 needs a GPU with compute capability >= 8.9 (Ada / Hopper); found {cap}")
+            model = convert_to_fp8(model)
         if config.compile:
             model = torch.compile(model)
         self.model = model

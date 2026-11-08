@@ -39,11 +39,13 @@ def main():
         lines.append("| flags | ms/step (median) | ms/step (p90) | compute ms | img/s | peak GiB | speedup |")
         lines.append("|---|---:|---:|---:|---:|---:|---:|")
         base = by_flags.get("")
-        keys = sorted(by_flags, key=lambda k: (k == "all" or "+" in k, ORDER.index(k) if k in ORDER else 99, k))
+        keys = sorted(by_flags, key=lambda k: ("+" in k, ORDER.index(k) if k in ORDER else 99, k))
         for k in keys:
             r = by_flags[k]
             speedup = f"{base['ms_per_step_median'] / r['ms_per_step_median']:.3f}x" if base else "n/a"
-            name = "baseline" if k == "" else ("all" if len(r["flags"]) >= len(ORDER) - 1 else k)
+            perf = set(ORDER[1:])
+            rest = [f for f in r["flags"] if f not in perf]
+            name = "baseline" if k == "" else ("+".join(["all"] + rest) if perf <= set(r["flags"]) else k)
             lines.append(f"| {name} | {r['ms_per_step_median']:.1f} | {r['ms_per_step_p90']:.1f} | "
                          f"{r['compute_ms_median']:.1f} | {r['imgs_per_sec']:.0f} | {r['peak_mem_gib']:.2f} | {speedup} |")
         lines.append("")

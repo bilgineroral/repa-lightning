@@ -10,6 +10,7 @@ bf16 (GPU): both versions are compared to an fp32 run of the original code; the 
 at most 1.5x the original's own bf16 error. The max abs diff between the two bf16 runs is reported.
 Exact equivalence assumes drop path = 0 (the default); with drop path the flags change the RNG draw order.
 """
+import math
 import os
 
 import numpy as np
@@ -18,10 +19,10 @@ import torch
 from PIL import Image
 
 from conftest import DIFFS
-from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
+from config import EXTRA_PERF_FLAGS, PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
 from dataset import PretrainDataset, build_pretrain_transform
 from modules import REPA
-from repa import LitREPA, prediction_loss
+from repa import LitREPA, convert_to_fp8, fp8_supported, prediction_loss
 
 CUDA = torch.cuda.is_available()
 needs_cuda = pytest.mark.skipif(not CUDA, reason="needs a CUDA GPU")
@@ -241,13 +242,15 @@ def test_perf_flag_parsing():
     assert parse_perf_flags("") == {}
     assert parse_perf_flags("all") == {f"perf_{n}": True for n in PERF_FLAGS}
     assert parse_perf_flags("causal_no_mask, fused_adamw") == {"perf_causal_no_mask": True, "perf_fused_adamw": True}
+    assert parse_perf_flags("all,fp8") == {**{f"perf_{n}": True for n in PERF_FLAGS}, "perf_fp8": True}
+    assert "perf_fp8" not in parse_perf_flags("all") # fp8 is opt-in by name
     with pytest.raises(ValueError):
         parse_perf_flags("not_a_flag")
 
 def test_old_config_without_perf_fields():
     """ configs pickled into older checkpoints have no perf_* attributes: everything falls back to off """
     cfg = make_config("tiny")
-    for n in PERF_FLAGS:
+    for n in PERF_FLAGS + EXTRA_PERF_FLAGS:
         delattr(cfg, f"perf_{n}")
     model = REPA(cfg)
     lit = LitREPA(cfg)
@@ -356,3 +359,49 @@ def test_fused_adamw_clipping_with_accumulation(tmp_path, monkeypatch):
     DIFFS.append(("fused AdamW + clip, accum 4, bf16", "pre-clip norm (rel)", pre_diff, "rtol 1e-4"))
     DIFFS.append(("fused AdamW + clip, accum 4, bf16", "weights (max rel)", worst, "rtol 1e-4"))
     assert pre_diff <= 1e-4 and worst <= 1e-4
+
+# ---------------------------------------------------------------- FP8 (Tier 2)
+
+needs_fp8 = pytest.mark.skipif(not fp8_supported(), reason="FP8 needs a GPU with compute capability >= 8.9")
+
+def test_fp8_conversion_keeps_parameters():
+    """ every Linear becomes a torchao Float8Linear; parameter names (so checkpoints) are unchanged. Runs on CPU. """
+    from torchao.float8.float8_linear import Float8Linear
+    torch.manual_seed(0)
+    model = REPA(make_config("tiny"))
+    names = [n for n, _ in model.named_parameters()]
+    n_linear = sum(isinstance(m, torch.nn.Linear) for m in model.modules())
+    model = convert_to_fp8(model)
+    assert [n for n, _ in model.named_parameters()] == names
+    assert sum(isinstance(m, Float8Linear) for m in model.modules()) == n_linear > 0
+
+@pytest.mark.skipif(fp8_supported(), reason="checks the refusal on GPUs without FP8")
+def test_fp8_refused_without_support():
+    with pytest.raises(RuntimeError, match="compute capability >= 8.9"):
+        LitREPA(make_config("tiny", "fp8"))
+
+@needs_fp8
+def test_fp8_loss_tracks_bf16():
+    """ FP8 is not bit-exact: 20 AdamW steps on the same batches (REPA-S shapes); per-step losses within 5% of bf16 """
+    losses = {}
+    for perf in ("", "fp8"):
+        torch.manual_seed(0)
+        cfg = make_config("small", perf)
+        lit = LitREPA(cfg).cuda().train()
+        opt = torch.optim.AdamW(lit.parameters(), lr=1e-4)
+        out = []
+        for step in range(20):
+            img, pos, s = make_batch(cfg, 8, "cuda", seed=step)
+            torch.manual_seed(1000 + step)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                tgt, pred = lit.model(img, position_ids=pos)
+                loss = prediction_loss(tgt, pred, s=s)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            out.append(loss.item())
+        losses[perf] = out
+    rel = [abs(a - b) / abs(b) for a, b in zip(losses["fp8"], losses[""])]
+    print(f"\nbf16 losses: {[round(x, 4) for x in losses['']]}\nfp8 losses:  {[round(x, 4) for x in losses['fp8']]}")
+    DIFFS.append(("fp8 vs bf16, 20 AdamW steps, S", "loss (max rel)", max(rel), "rtol 5e-2"))
+    assert all(math.isfinite(x) for x in losses["fp8"]) and max(rel) <= 5e-2

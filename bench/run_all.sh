@@ -103,6 +103,23 @@ for m in $MODELS; do
   done
 done
 
+# 6. FP8 (Tier 2): only if preflight found a GPU with compute capability >= 8.9
+if "$PY" -c "import json, sys; sys.exit(0 if json.load(open('$OUT/preflight.json')).get('fp8_possible') else 1)" 2>/dev/null; then
+  for m in $MODELS; do
+    [ -n "${BATCH[$m]:-}" ] || continue
+    for data in $DATAS; do
+      if [ "$data" = "real" ]; then extra=(--data-root "$DATA_ROOT" --num-workers "$NUM_WORKERS" --optimizer --accum "${ACCUM[$m]}");
+      else extra=(--no-optimizer); fi
+      for f in fp8 all,fp8; do
+        step "fp8 $m $data [$f]" "$PY" bench/step_time.py --model "$m" --flags "$f" --batch "${BATCH[$m]}" --data "$data" \
+          --warmup "$WARMUP" --steps "$STEPS" --out "$OUT/tier1" "${extra[@]}"
+      done
+    done
+  done
+else
+  echo; echo "########## fp8: skipped (preflight: GPU capability < 8.9, or preflight.json missing; see $OUT/preflight.json)"
+fi
+
 # summary
 step summarize "$PY" bench/summarize.py --results "$OUT/tier1" --out "$OUT/summary.md"
 
