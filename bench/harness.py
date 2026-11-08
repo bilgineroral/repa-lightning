@@ -139,6 +139,7 @@ def environment():
             return None
     return {
         "gpu": torch.cuda.get_device_name(0),
+        "gpu_mem_total_gib": torch.cuda.get_device_properties(0).total_memory / 2**30,
         "gpu_count": torch.cuda.device_count(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,

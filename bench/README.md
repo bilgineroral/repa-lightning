@@ -20,86 +20,92 @@ The model and loss are unchanged: same parameters, same checkpoints, and old che
 check equal loss and gradients. Equality is exact up to float rounding only with drop path 0 (the default). With
 drop path, `skip_last_content` changes the order of random draws.
 
-## Running on Arcturus
+## On Arcturus, from a fresh login
 
-### 1. Get the branch and set up the environment
+Run these from the repo root, in order.
+
+**1. Get the code**
 
 ```bash
-cd ~/repa-lightning
-git fetch origin
-git checkout repa-speedup
-git log -1 --oneline
+cd ~/repa-lightning && git fetch origin && git checkout repa-speedup && git pull
+```
+
+**2. Environment (once).** If a conda env named `repa` already exists, this only reports its versions and changes
+nothing. If it's missing packages, or isn't yours, the script prints what to do (for example
+`ENV_NAME=repa-bench bash bench/setup_env.sh`, then pass the same `ENV_NAME` to the next steps).
+
+```bash
+bash bench/setup_env.sh
+```
+
+**3. Preflight.** Reports GPUs (name, count, capability, memory, other processes), torch and CUDA versions, which
+attention kernel actually runs for our shapes, whether FP8 is possible, `sbatch`, CPUs and free disk. It also checks
+that `DATA_ROOT` has the layout `dataset.py` expects (`<root>/train/<wnid>/*.JPEG` and `<root>/val/<wnid>/*.JPEG`)
+and fails with what it found if not. Read the output before launching.
+
+```bash
+DATA_ROOT=$HOME/imagenet bash bench/preflight.sh
+```
+
+**4. Launch.** Submits `bench/run_all.sh` to Slurm if `sbatch` exists. Otherwise it starts a tmux session (or
+nohup) on `GPU=0` and refuses if that GPU is busy. Choose another with `GPU=<id>`. GPU count, time limit and
+partition are variables at the top of `bench/launch.sh`. The script prints how to check progress.
+
+```bash
+DATA_ROOT=$HOME/imagenet bash bench/launch.sh
+```
+
+`run_all.sh` runs, in order:
+1. preflight
+2. the full pytest suite
+3. a batch-size probe for S and B: the config batch (256 / 128), halved until it fits, checked with all flags too.
+   Gradient accumulation is set to keep the config's global batch of 4096.
+4. the Tier 1 matrix: baseline, each flag and all flags, for synthetic and real data
+5. profiles of baseline vs all flags
+
+Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_all.log`), the
+preflight JSON, the chosen batch sizes (`batch_sizes.txt`), one JSON per run, profiles and Chrome traces. A failed
+step doesn't stop the rest; failures are listed at the end of the log.
+
+**5. Summary**
+
+```bash
+cat bench/results/latest/summary.md
+```
+
+To regenerate it: `python bench/summarize.py --results bench/results/latest/tier1`.
+
+### Do not
+
+- Never write inside the dataset directories. Nothing in `bench/` writes there: preflight only lists and opens
+  files. Don't run `make_fake_imagefolder.py` with a real dataset path.
+- Check `nvidia-smi` before launching. Without Slurm, `launch.sh` refuses a busy GPU unless `FORCE=1`, but other
+  users' jobs can still start later and slow the timings.
+- Don't modify a shared or someone else's `repa` env. Use `ENV_NAME=repa-bench`.
+- Don't commit results. `bench/results/` is git-ignored.
+
+## Running parts by hand
+
+```bash
+python -m pytest tests/ -v
 ```
 
 ```bash
-conda env create -f environment.yml   # once; or reuse an existing env made from this file
-conda activate repa
-pip install pytest torchao            # pytest for the tests, torchao for the FP8 flag
-```
-
-Record what the machine actually has:
-
-```bash
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), torch.cuda.device_count())"
+CUDA_VISIBLE_DEVICES=0 DATA_ROOT=$HOME/imagenet BATCH_S=256 ACCUM_S=16 MODELS=S bash bench/run_tier1.sh
 ```
 
 ```bash
-nproc && nvidia-smi
-```
-
-### 2. Equivalence tests (a few minutes)
-
-```bash
-python -m pytest tests/test_perf_equivalence.py -v
-```
-
-The run ends with a "max differences vs. baseline" table. GPU tests are skipped when no GPU is visible.
-
-### 3. Tier 1 run matrix
-
-Real-data runs need an ImageFolder root with `train/`. Use one GPU so results are comparable:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 DATA_ROOT=$HOME/imagenet bash bench/run_tier1.sh
-```
-
-This runs baseline, each flag alone, and all flags, for models S and B, on synthetic and real data. Each run adds
-a JSON file to `bench/results/`, and the script ends by writing `bench/results/summary.md`.
-
-- Synthetic data: no decode cost and no optimizer step (`--no-optimizer`), to isolate the model step.
-- Real data: the real dataloader (8 workers by default) plus an optimizer step every micro-batch (`ACCUM=1`).
-  Pretraining steps the optimizer every 8 to 16 micro-batches, so `ACCUM=1` overstates optimizer cost. Use
-  `ACCUM=8` for a closer match.
-- Defaults are batch 256 (S) and 128 (B), the config values. Lower them if memory runs out: `BATCH_S=128 BATCH_B=64`.
-- Subsets: `MODELS=S DATAS=real ...`. Steps and warmup: `STEPS=100 WARMUP=20` (the warmup covers `torch.compile`).
-- `ddp_static_graph` does nothing on one GPU, so its row is expected to match the baseline.
-
-Single runs:
-
-```bash
-python bench/step_time.py --model S --flags all --data real --data-root $HOME/imagenet --optimizer
-```
-
-```bash
-python bench/summarize.py
-```
-
-### 4. Profiling (baseline vs. all flags)
-
-```bash
-python bench/profile_step.py --model S --flags none
+python bench/step_time.py --model S --flags all --data real --data-root $HOME/imagenet --optimizer --accum 16
 ```
 
 ```bash
 python bench/profile_step.py --model S --flags all
 ```
 
-Each run prints GPU time per step in buckets (matmul / attention / layernorm / other elementwise, plus optimizer and
-memcpy) and saves a JSON file and a Chrome trace to `bench/results/profiles/`. Open the trace in https://ui.perfetto.dev.
-
-### 5. FP8 (Tier 2)
-
-Not in this commit yet. It comes after the Tier 1 run.
+`run_tier1.sh` variables: `MODELS`, `DATAS`, `DATA_ROOT`, `BATCH_S`/`BATCH_B`, `ACCUM` (or `ACCUM_S`/`ACCUM_B`),
+`WARMUP` (20, covers `torch.compile`), `STEPS` (100), `NUM_WORKERS` (8), `OUT`. Synthetic runs have no data decode
+and no optimizer step, to isolate the model step. Real-data runs use the real dataloader and include the optimizer
+step every `ACCUM` micro-batches.
 
 ## What the numbers mean
 
@@ -108,6 +114,8 @@ Not in this commit yet. It comes after the Tier 1 run.
 - `compute ms`: start to end of one training batch. Excludes the wait for the next batch.
 - `img/s`: wall-clock throughput over the timed steps.
 - `speedup`: baseline ms/step divided by this row's ms/step, within the same table.
+- Profile buckets: GPU kernel time per step in matmul / attention / layernorm / other_elementwise (plus optimizer and
+  memcpy). Annotations are excluded.
 
 ## Running locally (no ImageNet)
 
@@ -116,7 +124,7 @@ python bench/make_fake_imagefolder.py --root ~/repa_fake --train 8000 --val 200
 ```
 
 ```bash
-MODELS=S BATCH_S=64 DATA_ROOT=~/repa_fake bash bench/run_tier1.sh
+MODELS=S STEPS=10 WARMUP=5 DATA_ROOT=~/repa_fake bash bench/launch.sh
 ```
 
 The fake JPEGs have realistic sizes, so decode cost is similar, but the content is random noise.
