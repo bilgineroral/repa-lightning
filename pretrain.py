@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EMAWeightAveraging, Ear
 from pytorch_lightning.utilities import rank_zero_only
 
 from dataset import PretrainDataset, ImageNetDataModule
-from config import PretrainConfig, PretrainConfigSmall
+from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
 from repa import LitREPA
 
 torch.serialization.add_safe_globals([PretrainConfig, PretrainConfigSmall]) # configs are pickled into checkpoints
@@ -18,6 +18,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 @rank_zero_only
 def rank_zero_print(*args, **kwargs):
     print(*args, **kwargs)
+
+def build_strategy(config):
+    """ "auto" (Lightning picks DDP with defaults when there are several GPUs), or DDP with static_graph=True
+    (perf_ddp_static_graph, multi-GPU only: a no-op on one GPU) """
+    if config.perf_ddp_static_graph and config.world_size > 1:
+        from pytorch_lightning.strategies import DDPStrategy
+        return DDPStrategy(static_graph=True)
+    return "auto"
 
 def main():
     p = argparse.ArgumentParser(description="Run REPA pretraining on ImageNet")
@@ -40,6 +48,7 @@ def main():
     p.add_argument("--use-permutation", type=int, choices=[0, 1], default=None, help="Use permutation sampling (1) or next-token sampling (0)")
     p.add_argument("--use-query-stream", type=int, choices=[0, 1], default=None, help="Predict with the query stream (1) or, as NEPA, from the content stream (0, needs --use-permutation 0)")
     p.add_argument("--model", type=str, choices=["base", "small"], default="base", help="ViT-B/16 (base) or ViT-S/16 (small) recipe")
+    p.add_argument("--perf", type=str, default="", help=f"Speed flags, comma separated, or 'all' (default: none): {', '.join(PERF_FLAGS)}")
     args = p.parse_args()
 
     Config = {"base": PretrainConfig, "small": PretrainConfigSmall}[args.model]
@@ -58,7 +67,8 @@ def main():
         blr=args.blr if args.blr is not None else Config.blr,
         max_epochs=args.max_epochs if args.max_epochs is not None else Config.max_epochs,
         warmup_ratio=args.warmup_ratio if args.warmup_ratio is not None else Config.warmup_ratio,
-        run=args.run_name if args.run_name is not None else Config.run
+        run=args.run_name if args.run_name is not None else Config.run,
+        **parse_perf_flags(args.perf),
     )
 
     rank_zero_print("Pretraining configuration:")
@@ -76,7 +86,8 @@ def main():
         sl=config.sl,
         sh=config.sh,
         base_seed=config.seed,
-        use_permutation=config.use_permutation
+        use_permutation=config.use_permutation,
+        uint8_images=config.perf_uint8_images,
     )
     val_dataset = PretrainDataset(
         args.data_root, "val",
@@ -85,7 +96,8 @@ def main():
         sl=config.sl,
         sh=config.sh,
         base_seed=(config.seed + 10_000_000_000),
-        use_permutation=config.use_permutation
+        use_permutation=config.use_permutation,
+        uint8_images=config.perf_uint8_images,
     )
     dm = ImageNetDataModule(
         train_ds=train_dataset,
@@ -93,6 +105,7 @@ def main():
         seed=config.seed,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
+        pin_memory=config.perf_uint8_images,
     )
     rank_zero_print(f"Use permutation: {config.use_permutation}, use query stream: {config.use_query_stream}")
     
@@ -159,6 +172,7 @@ def main():
         max_epochs=config.max_epochs,
         accelerator="auto",
         devices="auto",
+        strategy=build_strategy(config),
         precision=prec[config.amp_dtype],
         gradient_clip_val=config.grad_clip,
         accumulate_grad_batches=config.grad_accum_steps,

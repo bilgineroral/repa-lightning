@@ -7,7 +7,8 @@ import torch
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision.transforms import (
-    CenterCrop, Compose, InterpolationMode, Normalize, RandomHorizontalFlip, RandomResizedCrop, Resize, ToTensor
+    CenterCrop, Compose, InterpolationMode, Normalize, PILToTensor, RandomHorizontalFlip, RandomResizedCrop, Resize,
+    ToTensor
 )
 from timm.data import create_transform
 import pytorch_lightning as pl
@@ -50,22 +51,22 @@ def seed_training_batch(seed: int, epoch: int, batch_idx: int, rank: int) -> Non
     np.random.seed(s % 2**32)
     torch.manual_seed(s)
 
-def build_pretrain_transform(image_size: int, train: bool) -> Compose:
-    """ NEPA pretraining augmentations with ImageNet normalization """
+def build_pretrain_transform(image_size: int, train: bool, uint8: bool = False) -> Compose:
+    """ NEPA pretraining augmentations with ImageNet normalization
+    uint8: stop at uint8 [C,H,W]; LitREPA.on_after_batch_transfer applies ToTensor's scaling and Normalize on the GPU
+    (perf_uint8_images) """
     size = (image_size, image_size)
-    normalize = Normalize(mean=IMAGE_MEAN, std=IMAGE_STD)
+    to_tensor = [PILToTensor()] if uint8 else [ToTensor(), Normalize(mean=IMAGE_MEAN, std=IMAGE_STD)]
     if train:
         return Compose([
             RandomResizedCrop(size),
             RandomHorizontalFlip(),
-            ToTensor(),
-            normalize,
+            *to_tensor,
         ])
     return Compose([
         Resize(size),
         CenterCrop(size),
-        ToTensor(),
-        normalize,
+        *to_tensor,
     ])
 
 def build_finetune_transform(config: ClassificationConfig, image_size: int, train: bool) -> Compose:
@@ -127,8 +128,10 @@ class PretrainDataset(ImageNetDataset):
         sl: int = 1, sh: int = 1,
         base_seed: Optional[int] = None,
         use_permutation: bool = True,
+        uint8_images: bool = False,
     ):
-        super().__init__(root, split, build_pretrain_transform(image_size, train=(split == "train")), base_seed)
+        transform = build_pretrain_transform(image_size, train=(split == "train"), uint8=uint8_images)
+        super().__init__(root, split, transform, base_seed)
         self.sl, self.sh = sl, sh
         self.use_permutation = use_permutation
 
@@ -160,13 +163,14 @@ class PretrainDataset(ImageNetDataset):
         return item
 
 class ImageNetDataModule(pl.LightningDataModule):
-    def __init__(self, train_ds, val_ds, seed: int, batch_size: int, num_workers: int):
+    def __init__(self, train_ds, val_ds, seed: int, batch_size: int, num_workers: int, pin_memory: bool = False):
         super().__init__()
         self.train_ds = train_ds
         self.val_ds = val_ds
         self.seed = seed
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.pin_memory = pin_memory # perf_uint8_images
 
     def _get_sampler(self, ds, shuffle: bool, drop_last: bool):
         # single replica without DDP, so the order only depends on (seed, epoch) either way
@@ -184,6 +188,7 @@ class ImageNetDataModule(pl.LightningDataModule):
             persistent_workers=(self.num_workers > 0),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
         )
 
     def val_dataloader(self):
@@ -194,6 +199,7 @@ class ImageNetDataModule(pl.LightningDataModule):
             persistent_workers=(self.num_workers > 0),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
         )
 
 if __name__ == "__main__":

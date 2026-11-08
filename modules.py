@@ -82,8 +82,12 @@ class SelfAttention(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_kv: bool = False,
+        is_causal: bool = False,
+        q_expand: Optional[Tuple[int, int]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """ x_q: [B, Nq, D], x_kv: [B, Nk, D] or None, attn_mask: [Nq, Nk] bool, False = masked"""
+        """ x_q: [B, Nq, D], x_kv: [B, Nk, D] or None, attn_mask: [Nq, Nk] bool, False = masked
+        is_causal: square causal attention without a mask (attn_mask must be None)
+        q_expand: (B, Nq) when x_q is one row [1, 1, D] shared by every query (perf_query_proj_once) """
         if x_kv is None:
             x_kv = x_q
 
@@ -93,6 +97,9 @@ class SelfAttention(nn.Module):
         q = self.q_proj(x_q)
         q = q.view(B, Nq, H, d).transpose(1, 2)  # [B,H,Nq,d]
         q = self.q_norm(q)
+        if q_expand is not None:
+            B, Nq = q_expand
+            q = q.expand(B, H, Nq, d)
 
         if kv is None:
             Nk = x_kv.shape[1]
@@ -114,7 +121,8 @@ class SelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=mask,
-            dropout_p=self.attn_drop_p if self.training else 0.0
+            dropout_p=self.attn_drop_p if self.training else 0.0,
+            is_causal=is_causal,
         )
         out = out.transpose(1, 2).contiguous().view(B, Nq, D)
         out = self.proj(out)
@@ -123,6 +131,21 @@ class SelfAttention(nn.Module):
         if return_kv:
             return out, k, v
         return out
+
+    def project_kv(
+        self, x_kv: torch.Tensor, position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ K/V exactly as forward computes them, for a layer whose own queries are not needed (perf_skip_last_content) """
+        B, Nk, D = x_kv.shape
+        H, d = self.num_heads, self.head_dim
+        k, v = self.kv_proj(x_kv).split(D, dim=-1)
+        k = k.view(B, Nk, H, d).transpose(1, 2)  # [B,H,Nk,d]
+        v = v.view(B, Nk, H, d).transpose(1, 2)  # [B,H,Nk,d]
+        k = self.k_norm(k)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            k, _ = apply_rotary_pos_emb(k, None, cos, sin)
+        return k, v
 
 class MLP(nn.Module):
     def __init__(self, config: PretrainConfig):
@@ -178,20 +201,31 @@ class REPALayer(nn.Module):
         position_embeddings_g: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         attn_mask_h: Optional[torch.Tensor] = None,
         attn_mask_g: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+        content_needed: bool = True,
+        w: Optional[torch.Tensor] = None,
     ):
-        """ h: [B,1+N,D], g: [B,N,D] or None """
+        """ h: [B,1+N,D], g: [B,N,D] or None
+        is_causal: both streams have N rows and use causal attention without masks (perf_causal_no_mask)
+        content_needed=False: the content stream only provides K/V; returns h=None (perf_skip_last_content)
+        w: [1,1,D] when every row of g is w (layer 1): LN + Q projection run on one row (perf_query_proj_once) """
         h_in, g_in = h, g
         h_norm = self.ln1_h(h_in)
-        g_norm = self.ln1_g(g_in) if g is not None else None # before the content attention: keeps the op order
+        g_src = w if w is not None else g_in
+        g_norm = self.ln1_g(g_src) if g is not None else None # before the content attention: keeps the op order
 
         # self-attention
-        h_attn, k, v = self.attention(
-            x_q=h_norm, x_kv=h_norm,
-            position_embeddings=position_embeddings_h,
-            attn_mask=attn_mask_h,
-            return_kv=True,
-        )
-        h = h_in + self.drop_path1(self.ls1_h(h_attn))
+        if content_needed:
+            h_attn, k, v = self.attention(
+                x_q=h_norm, x_kv=h_norm,
+                position_embeddings=position_embeddings_h,
+                attn_mask=attn_mask_h,
+                return_kv=True,
+                is_causal=is_causal,
+            )
+            h = h_in + self.drop_path1(self.ls1_h(h_attn))
+        else:
+            k, v = self.attention.project_kv(h_norm, position_embeddings_h)
 
         if g is None: # content stream only
             h = h + self.drop_path2(self.ls2_h(self.mlp(self.ln2_h(h))))
@@ -202,12 +236,17 @@ class REPALayer(nn.Module):
             position_embeddings=position_embeddings_g,
             attn_mask=attn_mask_g,
             kv=(k, v),
+            is_causal=is_causal,
+            q_expand=tuple(g_in.shape[:2]) if w is not None else None,
         )
         g = g_in + self.drop_path1(self.ls1_g(g_attn))
 
         # mlp
-        h_ff = self.mlp(self.ln2_h(h))
-        h = h + self.drop_path2(self.ls2_h(h_ff))
+        if content_needed:
+            h_ff = self.mlp(self.ln2_h(h))
+            h = h + self.drop_path2(self.ls2_h(h_ff))
+        else:
+            h = None
 
         g_ff = self.mlp(self.ln2_g(g))
         g = g + self.drop_path2(self.ls2_g(g_ff))
@@ -227,9 +266,18 @@ class REPAEncoder(nn.Module):
         position_embeddings_g: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         attn_mask_h: Optional[torch.Tensor] = None,
         attn_mask_g: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+        skip_last_content: bool = False,
+        w: Optional[torch.Tensor] = None,
     ):
-        for layer in self.layers:
-            h, g = layer(h, g, position_embeddings_h, position_embeddings_g, attn_mask_h, attn_mask_g)
+        last = len(self.layers) - 1
+        for i, layer in enumerate(self.layers):
+            h, g = layer(
+                h, g, position_embeddings_h, position_embeddings_g, attn_mask_h, attn_mask_g,
+                is_causal=is_causal,
+                content_needed=not (skip_last_content and i == last),
+                w=w if i == 0 else None,
+            )
         return h, g
 
 class REPA(nn.Module):
@@ -259,6 +307,11 @@ class REPA(nn.Module):
             nn.init.trunc_normal_(self.w, mean=0.0, std=config.initializer_range)
         else:
             self.w = None
+
+        # speed flags (two-stream model only); getattr: configs pickled into older checkpoints don't have them
+        self.perf_skip_last_content = getattr(config, "perf_skip_last_content", False)
+        self.perf_causal_no_mask = getattr(config, "perf_causal_no_mask", False)
+        self.perf_query_proj_once = getattr(config, "perf_query_proj_once", False)
 
         self.apply(self._init_weights)
 
@@ -313,7 +366,21 @@ class REPA(nn.Module):
 
         h0 = self.dropout(h0)  # content stream sees the CLS token and patch embeddings
 
-        attn_mask_h, attn_mask_g = self._make_attn_masks(N, tgt.device)
+        two_stream = g0 is not None
+        causal = self.perf_causal_no_mask and two_stream
+        skip_last_content = self.perf_skip_last_content and two_stream
+        # with RoPE every row of g0 is w; with APE each row also has its position added
+        w = self.w if (self.perf_query_proj_once and two_stream and self.rope_embed is not None) else None
+
+        if causal:
+            # no query row attends to the last permuted patch (query t sees CLS and x_<=t), so dropping it gives both
+            # streams N rows and the same square causal mask: SDPA's is_causal, no explicit masks
+            h0 = h0[:, :-1]
+            if position_embeds_h is not None:
+                position_embeds_h = tuple(pe[:, :-1] for pe in position_embeds_h)
+            attn_mask_h = attn_mask_g = None
+        else:
+            attn_mask_h, attn_mask_g = self._make_attn_masks(N, tgt.device)
 
         h, g = self.encoder(
             h0, g0,
@@ -321,11 +388,21 @@ class REPA(nn.Module):
             position_embeddings_g=position_embeds_g,
             attn_mask_h=attn_mask_h,
             attn_mask_g=attn_mask_g,
+            is_causal=causal,
+            skip_last_content=skip_last_content,
+            w=w,
         )
 
         if g is None:
             # NEPA: the content stream at CLS, x_1..x_{N-1} predicts x_1..x_N
             return tgt, self.norm(h[:, :-1])
+        if skip_last_content:
+            # these last-layer parameters only fed the skipped content output: keep them in the graph with zero
+            # gradient, as h.sum() * 0.0 does, so DDP needs no find_unused_parameters
+            last = self.encoder.layers[-1]
+            unused = [p for p in (last.ln2_h.weight, last.ln2_h.bias, last.ls1_h.lambda1, last.ls2_h.lambda1)
+                      if p is not None]
+            return tgt, self.norm(g) + sum(p.sum() for p in unused) * 0.0
         return tgt, self.norm(g) + h.sum() * 0.0
 
 class SingleStreamREPALayer(nn.Module):

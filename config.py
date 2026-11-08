@@ -2,6 +2,21 @@ import torch
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 
+PERF_FLAGS = (
+    "skip_last_content", "causal_no_mask", "query_proj_once", "no_cpu_sync",
+    "uint8_images", "fused_adamw", "ddp_static_graph",
+)
+
+def parse_perf_flags(spec: str) -> dict:
+    """ --perf value ("a,b" or "all") -> {"perf_a": True, "perf_b": True} """
+    names = [n.strip() for n in (spec or "").split(",") if n.strip()]
+    if names == ["all"]:
+        names = list(PERF_FLAGS)
+    unknown = [n for n in names if n not in PERF_FLAGS]
+    if unknown:
+        raise ValueError(f"unknown --perf flags {unknown}; choose from {list(PERF_FLAGS)} or 'all'")
+    return {f"perf_{n}": True for n in names}
+
 def _grad_accum_steps(global_batch_size: int, batch_size: int, world_size: int) -> int:
     if global_batch_size % (batch_size * world_size) != 0:
         raise ValueError(f"global_batch_size {global_batch_size} is not divisible by batch_size {batch_size} x {world_size} devices")
@@ -79,6 +94,16 @@ class PretrainConfig:
     wandb_group: str = None
     wandb_project: str = "REPA"
     run: str = "repa-b-patch16-224-pretrain"
+
+    # ------------- Speed flags (False = original behaviour; see bench/README.md) -------------
+    # --------------------------------------------------------------------------------------------
+    perf_skip_last_content: bool = False # last layer: content stream computes only K/V (the rest never reaches the loss)
+    perf_causal_no_mask: bool = False # drop the last permuted patch from the content stream; is_causal SDPA, no masks
+    perf_query_proj_once: bool = False # layer 1: LN + Q projection of the query token w on one row, then broadcast
+    perf_no_cpu_sync: bool = False # masked-mean loss (no boolean indexing); train/lr logged once per epoch
+    perf_uint8_images: bool = False # uint8 images from pinned memory, normalized on the GPU
+    perf_fused_adamw: bool = False # AdamW(fused=True)
+    perf_ddp_static_graph: bool = False # DDP static_graph=True (multi-GPU only)
 
     # Derived attributes
     def __post_init__(self):
