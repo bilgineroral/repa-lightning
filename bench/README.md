@@ -21,6 +21,38 @@ Except for `fp8`, the model and loss are unchanged: same parameters, same checkp
 check equal loss and gradients. Equality is exact up to float rounding only with drop path 0 (the default). With
 drop path, `skip_last_content` changes the order of random draws.
 
+## Architecture flags (these change the model)
+
+Speed-only benchmarks of the report's alternatives. They **change the model**, so there are no equivalence tests. The
+sanity tests check that each setting builds, runs, gives every parameter a gradient, and lowers the loss over 50 steps
+on a tiny batch (`tests/test_arch_sanity.py`). Accuracy needs pilot runs. Set them with `--arch` in `pretrain.py` or
+the bench scripts, comma separated `name[=value]`. Config fields are `arch_<name>`, all off by default.
+
+| `--arch` | what changes | FLOP estimate |
+|---|---|---:|
+| `single_stream_ref` | no query stream: the content stream alone, square causal over the permuted order (reference for the two-stream cost) | 1.83 |
+| `query_top_k=K` | query stream only in the top K layers; it starts as `w` at layer L-K (K = 6, 4) | 1.36, 1.52 |
+| `single_stream_target_pos` | option B, as in `~/repa-notes/option_b_design.md`: single stream, row j gets the target position `e_tgt[pi_j]` added. Options: `target_pos_type=learned\|sincos`, `target_pos_layers=k` (add before each of the last k layers instead of at the input), `target_pos_null_p=p` (null token on a fraction of rows, excluded from the loss) | 1.83 |
+| `query_mlp_width=W` | separate query-stream MLP of width W (`2d`, `d`, or a number) | 1.26, 1.40 |
+| `train_res=160` | pretrain at 160 px (100 patches). RoPE coordinates are normalized, so no other change. | ~1.6 (schedule) |
+| `predict_frac=F` | predict only the last F of each order; query rows for the other targets aren't computed (F = 0.5, 0.25) | 1.36, 1.61 |
+
+FLOP estimates are the report's ratios to the two-stream baseline, not step-time predictions. `train_res`'s 1.6 is
+for a 75% / 25% 160 to 224 px schedule; one 160 px step is 2.12x (S) in `flop_model.py`.
+
+The single-stream modes set `use_query_stream=False` themselves (in `pretrain.py` and the bench). The two-stream perf
+flags (`skip_last_content`, `causal_no_mask`, `query_proj_once`) do nothing in single-stream mode. Option B always
+uses `is_causal`. Not implemented from the option B design: injecting the null token in fine-tuning
+(`classifier.py` / `segmentation.py`, its step 6).
+
+```bash
+MODELS=S BATCH_S=128 ACCUM_S=32 bash bench/run_arch.sh
+```
+
+This runs each setting alone and with all Tier 1 perf flags, plus both baselines, on synthetic data with the
+optimizer on. `run_all.sh` runs it after the Tier 1 matrix; results go to `bench/results/<timestamp>/arch/` and
+`summary_arch.md`.
+
 ## On Arcturus, from a fresh login
 
 Run these from the repo root, in order.
@@ -65,6 +97,7 @@ DATA_ROOT=$HOME/imagenet bash bench/launch.sh
 5. profiles of baseline vs all flags
 6. FP8 runs (`--perf fp8` and `all,fp8`), only if preflight found compute capability >= 8.9; otherwise skipped with
    a message
+7. the architecture-flag runs (`bench/run_arch.sh`)
 
 Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_all.log`), the
 preflight JSON, the chosen batch sizes (`batch_sizes.txt`), one JSON per run, profiles and Chrome traces. A failed
@@ -74,6 +107,10 @@ step doesn't stop the rest; failures are listed at the end of the log.
 
 ```bash
 cat bench/results/latest/summary.md
+```
+
+```bash
+cat bench/results/latest/summary_arch.md
 ```
 
 To regenerate it: `python bench/summarize.py --results bench/results/latest/tier1`.

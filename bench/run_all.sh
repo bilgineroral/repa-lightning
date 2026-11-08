@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The whole benchmark run on one GPU: preflight, tests, Tier 1 matrix (S and B), profiles. Usually started by
+# The whole benchmark run on one GPU: preflight, tests, Tier 1 matrix (S and B), profiles, FP8 (if supported),
+# architecture-flag runs. Usually started by
 # bench/launch.sh. Results and the log go to bench/results/<timestamp>/ (bench/results/latest points to it).
 #   DATA_ROOT=$HOME/imagenet bash bench/run_all.sh
 # Optional env vars: MODELS ("S B"), WARMUP (20), STEPS (100), NUM_WORKERS (8), ENV_NAME / PY (see env.sh).
@@ -120,8 +121,16 @@ else
   echo; echo "########## fp8: skipped (preflight: GPU capability < 8.9, or preflight.json missing; see $OUT/preflight.json)"
 fi
 
+# 7. architecture flags (change the model; speed only): bench/run_arch.sh, same batch and accumulation as above
+for m in $MODELS; do
+  [ -n "${BATCH[$m]:-}" ] || continue
+  step "arch $m" env MODELS="$m" BATCH_S="${BATCH[$m]}" BATCH_B="${BATCH[$m]}" ACCUM_S="${ACCUM[$m]}" ACCUM_B="${ACCUM[$m]}" \
+    WARMUP="$WARMUP" STEPS="$STEPS" OUT="$OUT/arch" PY="$PY" bash bench/run_arch.sh
+done
+
 # summary
 step summarize "$PY" bench/summarize.py --results "$OUT/tier1" --out "$OUT/summary.md"
+step "summarize arch" "$PY" bench/summarize.py --results "$OUT/arch" --out "$OUT/summary_arch.md"
 
 echo; echo "########## done ($(date +%H:%M:%S)): results in $OUT"
 if [ ${#FAILURES[@]} -gt 0 ]; then

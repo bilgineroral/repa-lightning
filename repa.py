@@ -4,24 +4,30 @@ import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
 import math
 
-from config import PretrainConfig
+from config import PretrainConfig, arch_predict_offset
 from dataset import IMAGE_MEAN, IMAGE_STD, seed_training_batch
 from modules import REPA
 from optim import get_decay_parameter_names, hf_accumulation_scale
 
-def prediction_loss(tgt, pred, s=None, sync_free: bool = False):
+def prediction_loss(tgt, pred, s=None, sync_free: bool = False, weight=None):
     """ tgt:  [B, T, D], pred: [B, T, D], s: [B] or None (targets before s are excluded)
-    sync_free: the same mean as a masked sum, without boolean indexing, which waits for the GPU (perf_no_cpu_sync) """
+    sync_free: the same mean as a masked sum, without boolean indexing, which waits for the GPU (perf_no_cpu_sync)
+    weight: [B, T] bool or None, False = excluded (option B's null-target rows) """
     tgt = tgt.detach()
     p = F.normalize(pred, dim=-1)
     z = F.normalize(tgt, dim=-1)
 
     loss = 1.0 - (p * z).sum(dim=-1) # [B, N]
-    if s is None: # every target is predicted, the first one from the CLS token (as NEPA)
+    if s is None and weight is None: # every target is predicted, the first one from the CLS token (as NEPA)
         return loss.mean()
 
-    s = s.to(device=loss.device)
-    include = torch.arange(loss.shape[1], device=loss.device)[None, :] >= s[:, None]
+    if s is not None:
+        s = s.to(device=loss.device)
+        include = torch.arange(loss.shape[1], device=loss.device)[None, :] >= s[:, None]
+    else:
+        include = torch.ones_like(loss, dtype=torch.bool)
+    if weight is not None:
+        include = include & weight.to(loss.device)
     if sync_free:
         weight = include.to(loss.dtype)
         return (loss * weight).sum() / weight.sum()
@@ -56,6 +62,9 @@ class LitREPA(pl.LightningModule):
 
         # speed flags; getattr: configs pickled into older checkpoints don't have them
         self.perf_no_cpu_sync = getattr(config, "perf_no_cpu_sync", False)
+        # architecture flags: option B's null rows and arch_predict_frac's offset (getattr: older pickled configs)
+        self.arch_null_p = getattr(config, "arch_target_pos_null_p", 0.0) if getattr(config, "arch_single_stream_target_pos", False) else 0.0
+        self.arch_predict_offset = arch_predict_offset(config)
         self.perf_fused_adamw = getattr(config, "perf_fused_adamw", False)
         if self.perf_fused_adamw and config.amp_dtype == "fp16":
             raise ValueError("perf_fused_adamw supports bf16 / fp32 only: fp16 needs the GradScaler path (see configure_gradient_clipping)")
@@ -76,6 +85,10 @@ class LitREPA(pl.LightningModule):
             embed.add(id(self.model.w))
         if self.model.pos_embed is not None:
             embed.add(id(self.model.pos_embed))
+        for name in ("tgt_pos_embed", "tgt_null"): # option B's target-position input, like pos_embed (weight decay on)
+            p = getattr(self.model, name, None)
+            if isinstance(p, torch.nn.Parameter):
+                embed.add(id(p))
 
         groups = [
             {"params": [], "weight_decay": cfg.weight_decay, "lr": cfg.embed_lr},
@@ -124,12 +137,25 @@ class LitREPA(pl.LightningModule):
 
     def forward(self, img, position_ids=None):
         return self.model(img, position_ids=position_ids)
+
+    def _predict(self, batch, train: bool):
+        """ model call, plus what the arch flags need for the loss: (tgt, pred, s, weight) """
+        img, position_ids, s = batch["img"], batch["position_ids"], batch["s"]
+        weight = None
+        if train and self.arch_null_p > 0: # option B: a random fraction of rows gets the null target, no loss
+            null_rows = torch.rand(position_ids.shape, device=img.device) < self.arch_null_p
+            tgt, pred = self.model(img, position_ids=position_ids, null_rows=null_rows)
+            weight = ~null_rows
+        else:
+            tgt, pred = self.model(img, position_ids=position_ids)
+        s = s if self.hparams.config.use_permutation else None
+        if s is not None and self.arch_predict_offset: # pred / tgt row i is target off + i
+            s = (s.to(img.device) - self.arch_predict_offset).clamp(min=0)
+        return tgt, pred, s, weight
     
     def training_step(self, batch, batch_idx):
-        img, position_ids, s = batch["img"], batch["position_ids"], batch["s"]
-        tgt, pred = self.model(img, position_ids=position_ids)
-        s = s if self.hparams.config.use_permutation else None
-        loss = prediction_loss(tgt, pred, s=s, sync_free=self.perf_no_cpu_sync)
+        tgt, pred, s, weight = self._predict(batch, train=True)
+        loss = prediction_loss(tgt, pred, s=s, sync_free=self.perf_no_cpu_sync, weight=weight)
         self.log("train/loss", loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         if self.perf_no_cpu_sync:
@@ -141,10 +167,8 @@ class LitREPA(pl.LightningModule):
         return loss * hf_accumulation_scale(batch_idx, self.trainer.num_training_batches, self.trainer.accumulate_grad_batches)
 
     def validation_step(self, batch, batch_idx):
-        img, position_ids, s = batch["img"], batch["position_ids"], batch["s"]
-        tgt, pred = self.model(img, position_ids=position_ids)
-        s = s if self.hparams.config.use_permutation else None
-        loss = prediction_loss(tgt, pred, s=s, sync_free=self.perf_no_cpu_sync)
+        tgt, pred, s, weight = self._predict(batch, train=False)
+        loss = prediction_loss(tgt, pred, s=s, sync_free=self.perf_no_cpu_sync, weight=weight)
         self.log("val/loss", loss, on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         return loss
     

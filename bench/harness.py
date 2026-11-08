@@ -13,13 +13,14 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
 
-from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
+from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_arch_flags, parse_perf_flags
 from dataset import IMAGE_MEAN, IMAGE_STD, ImageNetDataModule, PretrainDataset
 from repa import LitREPA
 
 def add_common_args(p):
     p.add_argument("--model", choices=["S", "B"], default="S")
     p.add_argument("--flags", default="none", help="comma-separated perf flags, 'all', or 'none' (baseline)")
+    p.add_argument("--arch", default="", help="architecture flags (change the model), e.g. query_top_k=4; see config.py")
     p.add_argument("--batch", type=int, default=None, help="per-device micro-batch (default: the config's)")
     p.add_argument("--data", choices=["synthetic", "real"], default="synthetic")
     p.add_argument("--data-root", default=None, help="ImageFolder root with train/ (needed for --data real)")
@@ -46,7 +47,11 @@ def build_config(args):
     batch = args.batch or Config.batch_size
     world = torch.cuda.device_count() # the config checks global batch % (batch * GPUs); the bench runs on one GPU
     flags = {} if not flag_names(args.flags) else parse_perf_flags(",".join(flag_names(args.flags)))
-    cfg = Config(batch_size=batch, global_batch_size=batch * world, compile=not args.no_compile, wandb=False, **flags)
+    arch = parse_arch_flags(args.arch, Config.hidden_size)
+    if arch.get("arch_single_stream_ref") or arch.get("arch_single_stream_target_pos"):
+        arch["use_query_stream"] = False
+    cfg = Config(batch_size=batch, global_batch_size=batch * world, compile=not args.no_compile, wandb=False,
+                 **flags, **arch)
     torch.set_float32_matmul_precision(cfg.matmul_precision) # as pretrain.py
     return cfg
 
@@ -155,4 +160,5 @@ def run_tag(args, flags):
     gpu = torch.cuda.get_device_name(0).replace("NVIDIA ", "").replace(" ", "-")
     rest = [f for f in flags if f not in PERF_FLAGS]
     name = "+".join(["all"] + rest) if set(PERF_FLAGS) <= set(flags) else ("+".join(flags) or "baseline")
-    return f"{args.model}_{args.data}_{name}_b{args.batch}_{gpu}_{time.strftime('%Y%m%d-%H%M%S')}"
+    arch = f"_arch-{args.arch.replace(',', '+').replace('=', '')}" if args.arch and args.arch != "none" else ""
+    return f"{args.model}_{args.data}_{name}{arch}_b{args.batch}_{gpu}_{time.strftime('%Y%m%d-%H%M%S')}"

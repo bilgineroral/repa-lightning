@@ -22,6 +22,46 @@ def parse_perf_flags(spec: str) -> dict:
         raise ValueError(f"unknown --perf flags {unknown}; choose from {list(PERF_FLAGS + EXTRA_PERF_FLAGS)} or 'all'")
     return {f"perf_{n}": True for n in names}
 
+# Architecture speed flags (change the model; for speed benchmarks and later pilots). --arch "name[=value],..."
+# "width" values accept "d" / "2d" (multiples of hidden_size) or an integer.
+ARCH_FLAGS = {
+    "single_stream_ref": bool, "query_top_k": int, "single_stream_target_pos": bool, "target_pos_type": str,
+    "target_pos_layers": int, "target_pos_null_p": float, "query_mlp_width": "width", "train_res": int,
+    "predict_frac": float,
+}
+
+def parse_arch_flags(spec: str, hidden_size: int) -> dict:
+    """ --arch value, e.g. "query_top_k=4" or "single_stream_target_pos,target_pos_type=sincos" -> {"arch_...": value} """
+    out = {}
+    for item in (x.strip() for x in (spec or "").split(",")):
+        if not item or item == "none":
+            continue
+        name, _, value = item.partition("=")
+        kind = ARCH_FLAGS.get(name)
+        if kind is None:
+            raise ValueError(f"unknown --arch flag {name!r}; choose from {list(ARCH_FLAGS)}")
+        if kind is bool:
+            if value not in ("", "1", "true", "True"):
+                raise ValueError(f"--arch {name} takes no value")
+            out[f"arch_{name}"] = True
+        elif kind == "width":
+            out[f"arch_{name}"] = (int(value[:-1] or 1) * hidden_size) if value.endswith("d") else int(value)
+        else:
+            out[f"arch_{name}"] = kind(value)
+    return out
+
+def arch_single_stream(config) -> bool:
+    """ the arch modes that run the content stream alone (no query stream) """
+    return getattr(config, "arch_single_stream_ref", False) or getattr(config, "arch_single_stream_target_pos", False)
+
+def arch_predict_offset(config) -> int:
+    """ arch_predict_frac: number of leading positions of each order that are neither computed nor predicted """
+    frac = getattr(config, "arch_predict_frac", 0.0)
+    if not frac:
+        return 0
+    n = (config.image_size // config.patch_size) ** 2
+    return n - int(round(frac * n))
+
 def _grad_accum_steps(global_batch_size: int, batch_size: int, world_size: int) -> int:
     if global_batch_size % (batch_size * world_size) != 0:
         raise ValueError(f"global_batch_size {global_batch_size} is not divisible by batch_size {batch_size} x {world_size} devices")
@@ -111,6 +151,18 @@ class PretrainConfig:
     perf_ddp_static_graph: bool = False # DDP static_graph=True (multi-GPU only)
     perf_fp8: bool = False # torchao float8 training for the Linear layers (GPU capability >= 8.9; not bit-exact)
 
+    # ------------- Architecture flags (CHANGE the model; off = original; see bench/README.md) -------------
+    # --------------------------------------------------------------------------------------------------------
+    arch_single_stream_ref: bool = False # no query stream: content stream alone, causal over the permuted order
+    arch_query_top_k: int = 0 # query stream only in the top K layers (0 = every layer)
+    arch_single_stream_target_pos: bool = False # option B (~/repa-notes/option_b_design.md): single stream + e_tgt
+    arch_target_pos_type: Literal["learned", "sincos"] = "learned" # option B: learned table or fixed 2D sin-cos
+    arch_target_pos_layers: int = 0 # option B: 0 = add e_tgt at the input, k = before each of the last k layers
+    arch_target_pos_null_p: float = 0.0 # option B: fraction of rows given a null token instead, excluded from the loss
+    arch_query_mlp_width: int = 0 # separate query-stream MLP of this hidden width (0 = the shared MLP)
+    arch_train_res: int = 0 # pretrain at this image size (0 = image_size); RoPE models only
+    arch_predict_frac: float = 0.0 # predict (and compute query rows for) only the last fraction of each order (0 = all)
+
     # Derived attributes
     def __post_init__(self):
         # Override qk_norm / layerscale based on ablation flags
@@ -118,8 +170,27 @@ class PretrainConfig:
             self.qk_norm = False
         if not self.use_layerscale:
             self.layerscale_value = None
-        if self.use_permutation and not self.use_query_stream:
+        single_stream = self.arch_single_stream_ref or self.arch_single_stream_target_pos
+        if self.arch_single_stream_ref and self.arch_single_stream_target_pos:
+            raise ValueError("choose one of arch_single_stream_ref and arch_single_stream_target_pos")
+        if single_stream and self.use_query_stream:
+            raise ValueError("arch_single_stream_* runs without the query stream: set use_query_stream=False")
+        if self.use_permutation and not self.use_query_stream and not single_stream:
             raise ValueError("random-order prediction needs the query stream (use_permutation requires use_query_stream)")
+        if (self.arch_query_top_k or self.arch_query_mlp_width or self.arch_predict_frac) and not self.use_query_stream:
+            raise ValueError("arch_query_top_k / arch_query_mlp_width / arch_predict_frac need the query stream")
+        if not 0 <= self.arch_query_top_k <= self.num_hidden_layers:
+            raise ValueError(f"arch_query_top_k must be in [0, {self.num_hidden_layers}]")
+        if not 0.0 <= self.arch_predict_frac < 1.0:
+            raise ValueError("arch_predict_frac must be in [0, 1)")
+        if not 0 <= self.arch_target_pos_layers <= self.num_hidden_layers:
+            raise ValueError(f"arch_target_pos_layers must be in [0, {self.num_hidden_layers}]")
+        if self.arch_train_res:
+            if not self.use_rope:
+                raise ValueError("arch_train_res needs RoPE (the APE table is sized for image_size)")
+            if self.arch_train_res % self.patch_size:
+                raise ValueError("arch_train_res must be a multiple of patch_size")
+            self.image_size = self.arch_train_res
 
         self.world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
         self.grad_accum_steps = _grad_accum_steps(self.global_batch_size, self.batch_size, self.world_size)

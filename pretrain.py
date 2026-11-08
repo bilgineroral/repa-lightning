@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EMAWeightAveraging, Ear
 from pytorch_lightning.utilities import rank_zero_only
 
 from dataset import PretrainDataset, ImageNetDataModule
-from config import EXTRA_PERF_FLAGS, PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_perf_flags
+from config import ARCH_FLAGS, EXTRA_PERF_FLAGS, PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_arch_flags, parse_perf_flags
 from repa import LitREPA
 
 torch.serialization.add_safe_globals([PretrainConfig, PretrainConfigSmall]) # configs are pickled into checkpoints
@@ -49,9 +49,13 @@ def main():
     p.add_argument("--use-query-stream", type=int, choices=[0, 1], default=None, help="Predict with the query stream (1) or, as NEPA, from the content stream (0, needs --use-permutation 0)")
     p.add_argument("--model", type=str, choices=["base", "small"], default="base", help="ViT-B/16 (base) or ViT-S/16 (small) recipe")
     p.add_argument("--perf", type=str, default="", help=f"Speed flags, comma separated, or 'all' (default: none): {', '.join(PERF_FLAGS)}; also {', '.join(EXTRA_PERF_FLAGS)} (not in 'all')")
+    p.add_argument("--arch", type=str, default="", help=f"Architecture flags (CHANGE the model), comma separated name[=value]: {', '.join(ARCH_FLAGS)}")
     args = p.parse_args()
 
     Config = {"base": PretrainConfig, "small": PretrainConfigSmall}[args.model]
+    arch = parse_arch_flags(args.arch, Config.hidden_size)
+    if (arch.get("arch_single_stream_ref") or arch.get("arch_single_stream_target_pos")) and args.use_query_stream is None:
+        args.use_query_stream = 0 # the single-stream modes run without the query stream
     config = Config(
         use_rope=bool(args.use_rope),
         use_qk_norm=bool(args.use_qk_norm),
@@ -69,6 +73,7 @@ def main():
         warmup_ratio=args.warmup_ratio if args.warmup_ratio is not None else Config.warmup_ratio,
         run=args.run_name if args.run_name is not None else Config.run,
         **parse_perf_flags(args.perf),
+        **arch,
     )
 
     rank_zero_print("Pretraining configuration:")

@@ -62,7 +62,8 @@ def main():
     compute = np.array([timer.starts[i].elapsed_time(timer.ends[i]) for i in range(w, w + n)])
     wall = timer.t1 - timer.t0 # covers the n timed steps plus the one stopping step
     result = {
-        "model": args.model, "flags": flags, "batch": cfg.batch_size, "data": args.data,
+        "model": args.model, "flags": flags, "arch": "" if args.arch in ("", "none") else args.arch,
+        "image_size": cfg.image_size, "batch": cfg.batch_size, "data": args.data,
         "data_root": args.data_root, "num_workers": args.num_workers if args.data == "real" else 0,
         "optimizer": optimizer, "accum": accum if optimizer else None, "precision": args.precision,
         "compile": cfg.compile, "warmup": w, "steps": n,
@@ -77,7 +78,7 @@ def main():
     path = os.path.join(args.out, run_tag(args, flags) + ".json")
     with open(path, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"{args.model} {args.data} [{'+'.join(flags) or 'baseline'}] b{cfg.batch_size}: "
+    print(f"{args.model} {args.data} [{'+'.join(flags) or 'baseline'}]{' arch ' + result['arch'] if result['arch'] else ''} b{cfg.batch_size}: "
           f"{result['ms_per_step_median']:.1f} ms/step (p90 {result['ms_per_step_p90']:.1f}), "
           f"{result['imgs_per_sec']:.0f} img/s, peak {result['peak_mem_gib']:.2f} GiB, "
           f"loss {result['loss_first']:.4f} -> {result['loss_last']:.4f} (finite: {result['loss_all_finite']}) -> {path}")

@@ -5,8 +5,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from config import PretrainConfig
-from rope import RoPE, apply_rotary_pos_emb, prepend_prefix_tokens
+from config import PretrainConfig, arch_predict_offset, arch_single_stream
+from rope import RoPE, apply_rotary_pos_emb, get_patches_center_coordinates, prepend_prefix_tokens
 
 class PatchEmbed(nn.Module):
     def __init__(self, config: PretrainConfig):
@@ -148,15 +148,16 @@ class SelfAttention(nn.Module):
         return k, v
 
 class MLP(nn.Module):
-    def __init__(self, config: PretrainConfig):
+    def __init__(self, config: PretrainConfig, intermediate_size: Optional[int] = None):
         super().__init__()
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size)
+        width = intermediate_size or config.intermediate_size # arch_query_mlp_width: a narrower query MLP
+        self.up_proj = nn.Linear(config.hidden_size, width)
+        self.down_proj = nn.Linear(width, config.hidden_size)
         self.dropout = nn.Dropout(config.drop)
         
         self.use_gated_mlp = config.use_gated_mlp
         if self.use_gated_mlp:
-            self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size)
+            self.gate_proj = nn.Linear(config.hidden_size, width)
 
         if config.hidden_act == "gelu":
             self.act_fn = F.gelu
@@ -171,6 +172,19 @@ class MLP(nn.Module):
         x = self.down_proj(x)
         x = self.dropout(x)
         return x
+
+def sincos_2d_table(grid: int, dim: int) -> torch.Tensor:
+    """ fixed 2D sin-cos table [grid * grid, dim]: half the channels encode y, half x (sin and cos each), at RoPE's patch
+    centers (get_patches_center_coordinates) mapped from [-1, 1] to grid units, with MAE-style frequencies (option B's
+    parameter-free target-position variant) """
+    pos = (get_patches_center_coordinates(grid, grid, torch.float32, "cpu") + 1) / 2 * grid # [N, 2] (y, x)
+    d = dim // 4
+    omega = 1.0 / 10000 ** (torch.arange(d, dtype=torch.float32) / d)
+    parts = []
+    for axis in (0, 1):
+        angles = pos[:, axis:axis + 1] * omega[None]
+        parts += [torch.sin(angles), torch.cos(angles)]
+    return torch.cat(parts, dim=1)
 
 class REPALayer(nn.Module):
     def __init__(self, config: PretrainConfig, drop_path_rate: float = 0.0):
@@ -192,6 +206,9 @@ class REPALayer(nn.Module):
         if config.use_query_stream:
             self.ln1_g = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.ln2_g = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # arch_query_mlp_width: the query stream gets its own MLP of this width instead of sharing self.mlp
+        query_mlp_width = getattr(config, "arch_query_mlp_width", 0)
+        self.query_mlp = MLP(config, query_mlp_width) if (config.use_query_stream and query_mlp_width) else None
 
     def forward(
         self,
@@ -221,7 +238,7 @@ class REPALayer(nn.Module):
                 position_embeddings=position_embeddings_h,
                 attn_mask=attn_mask_h,
                 return_kv=True,
-                is_causal=is_causal,
+                is_causal=is_causal and attn_mask_h is None,
             )
             h = h_in + self.drop_path1(self.ls1_h(h_attn))
         else:
@@ -236,7 +253,7 @@ class REPALayer(nn.Module):
             position_embeddings=position_embeddings_g,
             attn_mask=attn_mask_g,
             kv=(k, v),
-            is_causal=is_causal,
+            is_causal=is_causal and attn_mask_g is None, # arch_predict_frac keeps an explicit (offset) query mask
             q_expand=tuple(g_in.shape[:2]) if w is not None else None,
         )
         g = g_in + self.drop_path1(self.ls1_g(g_attn))
@@ -248,7 +265,8 @@ class REPALayer(nn.Module):
         else:
             h = None
 
-        g_ff = self.mlp(self.ln2_g(g))
+        mlp_g = self.mlp if self.query_mlp is None else self.query_mlp
+        g_ff = mlp_g(self.ln2_g(g))
         g = g + self.drop_path2(self.ls2_g(g_ff))
 
         return h, g
@@ -269,14 +287,24 @@ class REPAEncoder(nn.Module):
         is_causal: bool = False,
         skip_last_content: bool = False,
         w: Optional[torch.Tensor] = None,
+        query_start: int = 0,
+        h_add: Optional[torch.Tensor] = None,
+        h_add_from: int = 0,
     ):
+        """ query_start: first layer that runs the query stream (arch_query_top_k); g is the query input at that layer
+        h_add: added to h before each layer from h_add_from on (arch_target_pos_layers) """
         last = len(self.layers) - 1
+        g_start, g = g, (g if query_start == 0 else None)
         for i, layer in enumerate(self.layers):
+            if h_add is not None and i >= h_add_from:
+                h = h + h_add
+            if i == query_start:
+                g = g_start
             h, g = layer(
                 h, g, position_embeddings_h, position_embeddings_g, attn_mask_h, attn_mask_g,
                 is_causal=is_causal,
                 content_needed=not (skip_last_content and i == last),
-                w=w if i == 0 else None,
+                w=w if i == query_start else None,
             )
         return h, g
 
@@ -313,6 +341,25 @@ class REPA(nn.Module):
         self.perf_causal_no_mask = getattr(config, "perf_causal_no_mask", False)
         self.perf_query_proj_once = getattr(config, "perf_query_proj_once", False)
 
+        # architecture flags (change the model); getattr: configs pickled into older checkpoints don't have them
+        self.arch_single_stream = arch_single_stream(config)
+        self.arch_target_pos = getattr(config, "arch_single_stream_target_pos", False)
+        self.arch_target_pos_layers = getattr(config, "arch_target_pos_layers", 0)
+        self.arch_query_top_k = getattr(config, "arch_query_top_k", 0)
+        self.arch_predict_offset = arch_predict_offset(config)
+        self.tgt_null = None
+        if not self.arch_target_pos:
+            self.tgt_pos_embed = None
+        elif getattr(config, "arch_target_pos_type", "learned") == "sincos": # parameter-free variant
+            grid = config.image_size // config.patch_size
+            self.register_buffer("tgt_pos_embed", sincos_2d_table(grid, config.hidden_size)[None], persistent=False)
+        else: # option B default: learned table [1, N, D], initialized like pos_embed
+            self.tgt_pos_embed = nn.Parameter(torch.zeros(1, num_patches, config.hidden_size))
+            nn.init.trunc_normal_(self.tgt_pos_embed, mean=0.0, std=config.initializer_range)
+        if self.arch_target_pos and getattr(config, "arch_target_pos_null_p", 0.0) > 0:
+            self.tgt_null = nn.Parameter(torch.zeros(1, 1, config.hidden_size)) # option B: null target position
+            nn.init.trunc_normal_(self.tgt_null, mean=0.0, std=config.initializer_range)
+
         self.apply(self._init_weights)
 
     def _make_attn_masks(self, N: int, device: torch.device):
@@ -337,8 +384,10 @@ class REPA(nn.Module):
             if module.lambda1 is not None:
                 module.lambda1.data.fill_(self.config.layerscale_value)
 
-    def forward(self, img: torch.Tensor, position_ids: Optional[torch.Tensor] = None):
-        """ img: [B,C_in,H,W], position_ids: [B,N] or None """
+    def forward(self, img: torch.Tensor, position_ids: Optional[torch.Tensor] = None,
+                null_rows: Optional[torch.Tensor] = None):
+        """ img: [B,C_in,H,W], position_ids: [B,N] or None
+        null_rows: [B,N] bool, rows given the null target position (arch_target_pos_null_p, training only) """
         patches = self.patch_embed(img)
         B, N, D = patches.shape
 
@@ -366,6 +415,15 @@ class REPA(nn.Module):
 
         h0 = self.dropout(h0)  # content stream sees the CLS token and patch embeddings
 
+        if self.arch_single_stream:
+            return self._single_stream_forward(h0, tgt, position_embeds_h, position_ids, null_rows)
+
+        off = self.arch_predict_offset
+        if off and g0 is not None: # arch_predict_frac: no query rows for the first `off` targets of each order
+            g0 = g0[:, off:]
+            if position_embeds_g is not None:
+                position_embeds_g = tuple(pe[:, off:] for pe in position_embeds_g)
+
         two_stream = g0 is not None
         causal = self.perf_causal_no_mask and two_stream
         skip_last_content = self.perf_skip_last_content and two_stream
@@ -381,6 +439,10 @@ class REPA(nn.Module):
             attn_mask_h = attn_mask_g = None
         else:
             attn_mask_h, attn_mask_g = self._make_attn_masks(N, tgt.device)
+        if off and two_stream: # query row i is target off + i: it sees keys 0..off + i (CLS, x_pi0..x_pi(off+i-1))
+            attn_mask_g = torch.tril(torch.ones(N - off, h0.shape[1], dtype=torch.bool, device=tgt.device), diagonal=off)
+        L = len(self.encoder.layers)
+        query_start = L - self.arch_query_top_k if (self.arch_query_top_k and two_stream) else 0
 
         h, g = self.encoder(
             h0, g0,
@@ -391,19 +453,56 @@ class REPA(nn.Module):
             is_causal=causal,
             skip_last_content=skip_last_content,
             w=w,
+            query_start=query_start,
         )
 
         if g is None:
             # NEPA: the content stream at CLS, x_1..x_{N-1} predicts x_1..x_N
             return tgt, self.norm(h[:, :-1])
+        # parameters that no longer reach the loss stay in the graph with zero gradient, as h.sum() * 0.0 does, so DDP
+        # needs no find_unused_parameters
+        unused = []
+        for layer in self.encoder.layers[:query_start]: # arch_query_top_k: query-stream parts of the lower layers
+            unused += [layer.ln1_g.weight, layer.ln1_g.bias, layer.ln2_g.weight, layer.ln2_g.bias,
+                       layer.ls1_g.lambda1, layer.ls2_g.lambda1]
+            if layer.query_mlp is not None:
+                unused += list(layer.query_mlp.parameters())
+        tgt = tgt[:, off:] if off else tgt # arch_predict_frac: pred row i is target off + i
         if skip_last_content:
-            # these last-layer parameters only fed the skipped content output: keep them in the graph with zero
-            # gradient, as h.sum() * 0.0 does, so DDP needs no find_unused_parameters
+            # these last-layer parameters only fed the skipped content output
             last = self.encoder.layers[-1]
-            unused = [p for p in (last.ln2_h.weight, last.ln2_h.bias, last.ls1_h.lambda1, last.ls2_h.lambda1)
-                      if p is not None]
+            unused += [last.ln2_h.weight, last.ln2_h.bias, last.ls1_h.lambda1, last.ls2_h.lambda1]
+            if last.query_mlp is not None: # arch_query_mlp_width: the shared MLP only served the skipped content output
+                unused += list(last.mlp.parameters())
+            unused = [p for p in unused if p is not None]
             return tgt, self.norm(g) + sum(p.sum() for p in unused) * 0.0
+        unused = [p for p in unused if p is not None]
+        if unused:
+            return tgt, self.norm(g) + h.sum() * 0.0 + sum(p.sum() for p in unused) * 0.0
         return tgt, self.norm(g) + h.sum() * 0.0
+
+    def _single_stream_forward(self, h0, tgt, position_embeds_h, position_ids, null_rows):
+        """ arch_single_stream_ref / arch_single_stream_target_pos (option B, ~/repa-notes/option_b_design.md):
+        the content stream alone, square causal over the permuted order. Row j (CLS for j = 0, else x_pi(j-1)) predicts
+        x_pi(j); the last permuted patch is dropped from the input since no row predicts from it. Option B adds the
+        target position e_tgt[pi(j)] to row j, at the input or before each of the last k layers. """
+        B, N, D = tgt.shape
+        h0 = h0[:, :-1]
+        if position_embeds_h is not None:
+            position_embeds_h = tuple(pe[:, :-1] for pe in position_embeds_h)
+        h_add, h_add_from = None, 0
+        if self.arch_target_pos:
+            table = self.tgt_pos_embed.expand(B, -1, -1)
+            e_tgt = table if position_ids is None else table.gather(1, position_ids[:, :, None].expand(B, N, D))
+            if null_rows is not None and self.tgt_null is not None:
+                e_tgt = torch.where(null_rows[:, :, None], self.tgt_null.expand_as(e_tgt), e_tgt)
+            if self.arch_target_pos_layers:
+                h_add, h_add_from = e_tgt, len(self.encoder.layers) - self.arch_target_pos_layers
+            else:
+                h0 = h0 + e_tgt
+        h, _ = self.encoder(h0, None, position_embeddings_h=position_embeds_h, is_causal=True,
+                            h_add=h_add, h_add_from=h_add_from)
+        return tgt, self.norm(h)
 
 class SingleStreamREPALayer(nn.Module):
     """ Content stream of a REPALayer, run with bidirectional attention """
