@@ -296,3 +296,63 @@ def test_lightning_all_flags_matches_baseline(tmp_path):
     DIFFS.append(("lightning 1 epoch bf16 [fused_adamw]", "train/loss", d, "rtol 1e-4"))
     DIFFS.append(("lightning 1 epoch bf16 [fused_adamw]", "weights (max rel)", worst, "rtol 1e-4"))
     assert worst <= 1e-4
+
+@needs_cuda
+def test_fused_adamw_clipping_with_accumulation(tmp_path, monkeypatch):
+    """ bf16-mixed, accumulate_grad_batches=4, 8 batches: clipping must run once per optimizer step (after batch 3
+    and 7, i.e. after accumulation), on unscaled gradients, and fused / non-fused must end with the same weights """
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import Callback
+    from dataset import ImageNetDataModule
+
+    root = _fake_imagefolder(str(tmp_path), n=32) # 32 images / batch 4 = 8 micro-batches = 2 optimizer steps
+    clip_val, accum = 0.05, 4 # small, so clipping really scales the gradients
+    real_clip = torch.nn.utils.clip_grad_norm_
+    calls, state = [], {"batch": None}
+
+    def spy(parameters, max_norm, *args, **kwargs):
+        params = [p for p in parameters if p.grad is not None]
+        pre = real_clip(params, max_norm, *args, **kwargs) # returns the norm before clipping
+        post = torch.linalg.vector_norm(torch.stack([p.grad.detach().float().norm() for p in params]))
+        calls.append({"batch_idx": state["batch"], "pre": pre.item(), "post": post.item()})
+        return pre
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
+
+    class Track(Callback):
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            state["batch"] = batch_idx
+
+    def fit(perf):
+        calls.clear()
+        cfg = make_config("tiny", perf, batch_size=4, global_batch_size=4 * accum * torch.cuda.device_count(),
+                          grad_clip=clip_val)
+        assert cfg.grad_accum_steps == accum
+        torch.manual_seed(0)
+        lit = LitREPA(cfg)
+        kw = dict(image_size=64, patch_size=16, base_seed=1)
+        dm = ImageNetDataModule(PretrainDataset(root, "train", **kw), PretrainDataset(root, "val", **kw),
+                                seed=1, batch_size=4, num_workers=0)
+        trainer = pl.Trainer(max_epochs=1, accelerator="gpu", devices=1, precision="bf16-mixed", logger=False,
+                             gradient_clip_val=cfg.grad_clip, accumulate_grad_batches=cfg.grad_accum_steps,
+                             enable_checkpointing=False, enable_progress_bar=False, limit_val_batches=0,
+                             enable_model_summary=False, use_distributed_sampler=False, callbacks=[Track()])
+        trainer.fit(lit, datamodule=dm)
+        weights = {n: p.detach().cpu() for n, p in lit.named_parameters()}
+        return list(calls), trainer.precision_plugin.scaler, trainer.global_step, weights
+
+    c_ref, scaler_ref, steps_ref, w_ref = fit("")
+    c_new, scaler_new, steps_new, w_new = fit("fused_adamw")
+    print(f"\nnon-fused clip calls: {c_ref}\nfused clip calls:     {c_new}\n"
+          f"scaler (non-fused, fused): {scaler_ref}, {scaler_new}; optimizer steps: {steps_ref}, {steps_new}")
+
+    assert scaler_ref is None and scaler_new is None # bf16-mixed has no GradScaler: gradients are never scaled
+    assert steps_ref == steps_new == 2
+    for calls_ in (c_ref, c_new):
+        assert [c["batch_idx"] for c in calls_] == [accum - 1, 2 * accum - 1] # once per step, after the 4th backward
+        for c in calls_:
+            assert c["pre"] > clip_val and abs(c["post"] - clip_val) <= 1e-3 * clip_val # clipping took effect
+    pre_diff = max(abs(a["pre"] - b["pre"]) / b["pre"] for a, b in zip(c_new, c_ref))
+    worst = max(max_rel(w_new[n], w_ref[n])[1] for n in w_ref)
+    DIFFS.append(("fused AdamW + clip, accum 4, bf16", "pre-clip norm (rel)", pre_diff, "rtol 1e-4"))
+    DIFFS.append(("fused AdamW + clip, accum 4, bf16", "weights (max rel)", worst, "rtol 1e-4"))
+    assert pre_diff <= 1e-4 and worst <= 1e-4

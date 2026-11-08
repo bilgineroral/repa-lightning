@@ -98,14 +98,21 @@ def build_datamodule(args, cfg, n_batches):
                               num_workers=args.num_workers, pin_memory=cfg.perf_uint8_images)
 
 class StopAfter(Callback):
-    """ stops after n training batches (spans epochs if the dataset is small) """
+    """ stops after n training batches (spans epochs if the dataset is small); keeps each step's loss on the GPU """
     def __init__(self, n):
-        self.n, self.seen = n, 0
+        self.n, self.seen, self.losses = n, 0, []
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.seen += 1
+        self.losses.append(outputs["loss"].detach().float())
         if self.seen >= self.n:
             trainer.should_stop = True
+
+    def loss_summary(self):
+        losses = torch.stack(self.losses).cpu() if self.losses else torch.empty(0)
+        return {"loss_first": losses[0].item() if len(losses) else None,
+                "loss_last": losses[-1].item() if len(losses) else None,
+                "loss_all_finite": bool(torch.isfinite(losses).all()) if len(losses) else None}
 
 def build_trainer(args, cfg, callbacks):
     optimizer = args.optimizer if args.optimizer is not None else (args.data == "real")
@@ -120,6 +127,9 @@ def build_trainer(args, cfg, callbacks):
         callbacks=[StopAfter(total), *callbacks],
     )
     return trainer, optimizer, accum, total
+
+def stop_callback(trainer):
+    return next(c for c in trainer.callbacks if isinstance(c, StopAfter))
 
 def environment():
     def git(*a):

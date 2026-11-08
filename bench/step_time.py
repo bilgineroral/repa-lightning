@@ -18,7 +18,7 @@ import torch
 from pytorch_lightning.callbacks import Callback
 
 from harness import (REPO, LitREPA, add_common_args, build_config, build_datamodule, build_trainer, environment,
-                     flag_names, run_tag)
+                     flag_names, run_tag, stop_callback)
 
 class StepTimer(Callback):
     def __init__(self, warmup):
@@ -70,6 +70,7 @@ def main():
         "compute_ms_median": float(np.median(compute)), "compute_ms_p90": float(np.percentile(compute, 90)),
         "imgs_per_sec": cfg.batch_size * (n + 1) / wall,
         "peak_mem_gib": torch.cuda.max_memory_allocated() / 2**30,
+        **stop_callback(trainer).loss_summary(),
         **environment(),
     }
     os.makedirs(args.out, exist_ok=True)
@@ -78,7 +79,8 @@ def main():
         json.dump(result, f, indent=2)
     print(f"{args.model} {args.data} [{'+'.join(flags) or 'baseline'}] b{cfg.batch_size}: "
           f"{result['ms_per_step_median']:.1f} ms/step (p90 {result['ms_per_step_p90']:.1f}), "
-          f"{result['imgs_per_sec']:.0f} img/s, peak {result['peak_mem_gib']:.2f} GiB -> {path}")
+          f"{result['imgs_per_sec']:.0f} img/s, peak {result['peak_mem_gib']:.2f} GiB, "
+          f"loss {result['loss_first']:.4f} -> {result['loss_last']:.4f} (finite: {result['loss_all_finite']}) -> {path}")
 
 if __name__ == "__main__":
     main()
