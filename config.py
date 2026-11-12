@@ -50,6 +50,29 @@ def parse_arch_flags(spec: str, hidden_size: int) -> dict:
             out[f"arch_{name}"] = kind(value)
     return out
 
+# Tier 3 kernel flags (same model and loss; ~/repa-notes/kernel_research.md). --kern "patch_linear,attn_fused=gqa"
+KERN_FLAGS = {"patch_linear": bool, "attn_fused": ("gqa", "flex")}
+
+def parse_kern_flags(spec: str) -> dict:
+    """ --kern value, e.g. "patch_linear" or "patch_linear,attn_fused=flex" -> {"kern_...": value} """
+    out = {}
+    for item in (x.strip() for x in (spec or "").split(",")):
+        if not item or item == "none":
+            continue
+        name, _, value = item.partition("=")
+        kind = KERN_FLAGS.get(name)
+        if kind is None:
+            raise ValueError(f"unknown --kern flag {name!r}; choose from {list(KERN_FLAGS)}")
+        if kind is bool:
+            if value not in ("", "1", "true", "True"):
+                raise ValueError(f"--kern {name} takes no value")
+            out[f"kern_{name}"] = True
+        else:
+            if value not in kind:
+                raise ValueError(f"--kern {name} must be one of {list(kind)}, got {value!r}")
+            out[f"kern_{name}"] = value
+    return out
+
 def arch_single_stream(config) -> bool:
     """ the arch modes that run the content stream alone (no query stream) """
     return getattr(config, "arch_single_stream_ref", False) or getattr(config, "arch_single_stream_target_pos", False)
@@ -163,6 +186,13 @@ class PretrainConfig:
     arch_train_res: int = 0 # pretrain at this image size (0 = image_size); RoPE models only
     arch_predict_frac: float = 0.0 # predict (and compute query rows for) only the last fraction of each order (0 = all)
 
+    # ------------- Kernel flags (same model and loss; off = original; see bench/README.md) -------------
+    # ---------------------------------------------------------------------------------------------------
+    kern_patch_linear: bool = False # patch embedding as reshape + one GEMM instead of Conv2d (same weights)
+    # both streams' attention in one call over the shared K/V: "gqa" (SDPA enable_gqa, interleaved heads) or "flex"
+    # (FlexAttention, interleaved rows, mask q // 2 >= kv); "" = two calls. Takes effect with perf_causal_no_mask only
+    kern_attn_fused: str = ""
+
     # Derived attributes
     def __post_init__(self):
         # Override qk_norm / layerscale based on ablation flags
@@ -191,6 +221,8 @@ class PretrainConfig:
             if self.arch_train_res % self.patch_size:
                 raise ValueError("arch_train_res must be a multiple of patch_size")
             self.image_size = self.arch_train_res
+        if self.kern_attn_fused not in ("", "gqa", "flex"):
+            raise ValueError(f"kern_attn_fused must be '', 'gqa' or 'flex', got {self.kern_attn_fused!r}")
 
         self.world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
         self.grad_accum_steps = _grad_accum_steps(self.global_batch_size, self.batch_size, self.world_size)

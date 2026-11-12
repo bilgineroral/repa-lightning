@@ -90,7 +90,7 @@ def main():
     n = args.steps
 
     result = {
-        "model": args.model, "flags": flags, "batch": cfg.batch_size, "data": args.data, "optimizer": optimizer,
+        "model": args.model, "flags": flags, "kern": args.kern, "batch": cfg.batch_size, "data": args.data, "optimizer": optimizer,
         "accum": accum if optimizer else None, "precision": args.precision, "compile": cfg.compile, "steps_profiled": n,
         "gpu_span_ms_per_step": span / 1e3 / n, "gpu_busy_ms_per_step": busy / 1e3 / n,
         "gpu_idle_pct": 100 * (1 - busy / span) if span else None,

@@ -109,3 +109,45 @@ def test_write_json_atomic(tmp_path):
     p = str(tmp_path / "x.json")
     kr.write_json(p, {"a": 1})
     assert json.load(open(p)) == {"a": 1} and not os.path.exists(p + ".tmp")
+
+def test_preflight_kernel_family_cudnn_not_flash():
+    """ bench/preflight.py: cuDNN SDPA kernel names contain "flash"; they used to be labelled flash """
+    import preflight
+    cudnn = ["cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_1_128x64x64_4x1x1_cga1x1x1_kernel0_0"]
+    assert preflight.kernel_family(cudnn) == "cudnn"
+    assert preflight.kernel_family(["void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<64>>"]) == "flash"
+    assert preflight.kernel_family(["fmha_cutlassF_bf16_aligned_64x64_rf_sm80(PyTorchMemEffAttention)"]) == "mem_efficient"
+
+def test_cache_families_and_sdpa_isolation(tmp_path):
+    s = lambda mode, cd=False: {"mode": mode, "coord_descent": cd}
+    # CUDA graphs on/off share; coordinate descent and max-autotune don't mix with the default family
+    assert kr.cache_family(s("default")) == kr.cache_family(s("reduce-overhead")) == "default"
+    assert kr.cache_family(s("max-autotune")) == kr.cache_family(s("max-autotune-no-cudagraphs")) == "max-autotune"
+    assert kr.cache_family(s("max-autotune", True)) == "max-autotune+cd" != kr.cache_family(s("max-autotune"))
+    env = kr.cache_env(str(tmp_path), s("max-autotune"), "default")
+    assert env == {"TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "inductor_cache" / "max-autotune")}
+    env = kr.cache_env(str(tmp_path), s("max-autotune"), "cudnn") # same autotune results, own compiled graphs
+    assert env["TORCHINDUCTOR_CACHE_DIR"].endswith("max-autotune")
+    assert env["TORCHINDUCTOR_FX_GRAPH_CACHE"] == "0" and env["TORCHINDUCTOR_AUTOGRAD_CACHE"] == "0"
+
+def test_kern_steps_pass_flags():
+    plan = {s.id: s for s in kr.build_plan(["S"], dry_run=True)}
+    assert plan["05_patch_linear_S"].kern == "patch_linear"
+    assert plan["05_attn_fused_flex_S"].kern == "attn_fused=flex"
+    hw, args = {"capability": [8, 6], "sms": 28}, SimpleNamespace(dry_run=True, data_root=None)
+    fields = {"kern_patch_linear", "kern_attn_fused"}
+    assert kr.unmet(plan["05_attn_fused_gqa_S"], hw, args, fields) is None # runs in a dry run once config.py has it
+    runner = kr.Runner(SimpleNamespace(batch_s=32, batch_b=16, global_batch=None, warmup=3, steps=5, profile_steps=3,
+                                       data_root=None, num_workers=4, dry_run=True), hw, "python", "/tmp/x", print)
+    assert runner.batch_accum("S") == (32, 2) # dry run: optimizer steps happen within the few steps
+    runner.args.dry_run = False
+    assert runner.batch_accum("S") == (32, 128) # full run: config's global batch 4096
+    st = plan["05_attn_fused_flex_S"]
+    cmd = runner.command(st, kr.resolve(st, {}), "/tmp/x/raw")
+    assert cmd[cmd.index("--kern") + 1] == "attn_fused=flex"
+
+def test_skip_patterns():
+    hw = {"capability": [8, 9], "sms": 142}
+    args = SimpleNamespace(dry_run=False, data_root=None, skip=[r"max-autotune\+cd"])
+    assert kr.unmet(kr.Step("02_compile_S_max-autotune+cd", "time", "S"), hw, args, set()).startswith("--skip")
+    assert kr.unmet(kr.Step("02_compile_S_max-autotune", "time", "S"), hw, args, set()) is None

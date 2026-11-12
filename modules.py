@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from config import PretrainConfig, arch_predict_offset, arch_single_stream
 from rope import RoPE, apply_rotary_pos_emb, get_patches_center_coordinates, prepend_prefix_tokens
@@ -12,12 +13,21 @@ class PatchEmbed(nn.Module):
     def __init__(self, config: PretrainConfig):
         super().__init__()
         self.patch_embed = nn.Conv2d(
-            config.num_channels, config.hidden_size, 
+            config.num_channels, config.hidden_size,
             kernel_size=config.patch_size, stride=config.patch_size
         )
+        self.patch_size = config.patch_size
+        self.kern_patch_linear = getattr(config, "kern_patch_linear", False) # getattr: older pickled configs
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         """ img: [B,C_in,H,W] """
+        B, C, H, W = img.shape
+        p = self.patch_size
+        if self.kern_patch_linear and H % p == 0 and W % p == 0:
+            # kern_patch_linear: the stride-p convolution as one GEMM over non-overlapping patches; each patch is
+            # flattened in the conv weight's (C, p, p) order, so the same weight [D, C, p, p] works as [D, C*p*p]
+            x = img.reshape(B, C, H // p, p, W // p, p).permute(0, 2, 4, 1, 3, 5).reshape(B, (H // p) * (W // p), C * p * p)
+            return F.linear(x, self.patch_embed.weight.flatten(1), self.patch_embed.bias) # [B,N,D]
         return self.patch_embed(img).flatten(2).transpose(1, 2) # [B,N,D]
 
 class DropPath(nn.Module):
@@ -147,6 +157,74 @@ class SelfAttention(nn.Module):
             k, _ = apply_rotary_pos_emb(k, None, cos, sin)
         return k, v
 
+    def fused_two_stream(
+        self,
+        x_h: torch.Tensor,
+        x_g: torch.Tensor,
+        position_embeddings_h: Optional[tuple[torch.Tensor, torch.Tensor]],
+        position_embeddings_g: Optional[tuple[torch.Tensor, torch.Tensor]],
+        mode: str,
+        q_expand: Optional[Tuple[int, int]] = None,
+        block_mask=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ kern_attn_fused: both streams in one attention call over the content stream's K/V, for the square causal
+        case (perf_causal_no_mask). The same math as forward(x_h, is_causal=True, return_kv=True) followed by
+        forward(x_g, kv=(k, v), is_causal=True): query row t and content row t both see keys 0..t.
+        mode "gqa": queries stacked as 2H heads (2i = content head i, 2i + 1 = query head i), so SDPA's enable_gqa maps
+            both to K/V head i.
+        mode "flex": queries interleaved as 2N rows (2t = content t, 2t + 1 = query t) with the block mask q // 2 >= kv,
+            so each FlexAttention tile serves both streams from the same K/V loads.
+        x_h: [B, N, D], x_g: [B, N, D] (or [1, 1, D] with q_expand = (B, N)); returns (h_out, g_out), each [B, N, D]
+        block_mask: interleaved_causal_block_mask(N) for "flex" (REPA.forward builds it once per forward) """
+        B, N, D = x_h.shape
+        H, d = self.num_heads, self.head_dim
+
+        q_h = self.q_norm(self.q_proj(x_h).view(B, N, H, d).transpose(1, 2)) # [B,H,N,d]
+        k, v = self.kv_proj(x_h).split(D, dim=-1)
+        k = self.k_norm(k.view(B, N, H, d).transpose(1, 2))
+        v = v.view(B, N, H, d).transpose(1, 2)
+        Bg, Ng = x_g.shape[:2]
+        q_g = self.q_norm(self.q_proj(x_g).view(Bg, Ng, H, d).transpose(1, 2))
+        if q_expand is not None:
+            q_g = q_g.expand(B, H, N, d)
+        if position_embeddings_h is not None:
+            q_h, k = apply_rotary_pos_emb(q_h, k, *position_embeddings_h)
+        if position_embeddings_g is not None:
+            q_g, _ = apply_rotary_pos_emb(q_g, None, *position_embeddings_g)
+
+        if mode == "gqa":
+            q = torch.stack([q_h, q_g], dim=2).reshape(B, 2 * H, N, d)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True).view(B, H, 2, N, d)
+            o_h, o_g = out[:, :, 0], out[:, :, 1]
+        elif mode == "flex":
+            # SDPA's autocast casts q, k, v to the autocast dtype; flex_attention isn't on autocast's list, so do the same
+            dev = q_h.device.type
+            dt = torch.get_autocast_dtype(dev) if torch.is_autocast_enabled(dev) else q_h.dtype
+            q = torch.stack([q_h, q_g], dim=3).reshape(B, H, 2 * N, d).to(dt)
+            if block_mask is None:
+                block_mask = interleaved_causal_block_mask(N, q.device)
+            out = flex_attention(q, k.to(dt), v.to(dt), block_mask=block_mask)
+            out = out.view(B, H, N, 2, d)
+            o_h, o_g = out[:, :, :, 0], out[:, :, :, 1]
+        else:
+            raise ValueError(f"kern_attn_fused mode must be 'gqa' or 'flex', got {mode!r}")
+        return self._project_out(o_h), self._project_out(o_g)
+
+    def _project_out(self, out: torch.Tensor) -> torch.Tensor:
+        """ [B,H,N,d] attention output -> proj -> dropout, as the end of forward """
+        B, H, N, d = out.shape
+        return self.drop(self.proj(out.transpose(1, 2).reshape(B, N, H * d)))
+
+def interleaved_causal_mask_mod(b, h, q_idx, kv_idx):
+    """ kern_attn_fused="flex": query row q (2t = content t, 2t + 1 = query t) sees keys 0..q // 2 """
+    return q_idx // 2 >= kv_idx
+
+def interleaved_causal_block_mask(n: int, device: torch.device):
+    """ FlexAttention block mask for 2n interleaved query rows over n keys. Built fresh on every call, on purpose: a
+    mask cached across calls holds tensors that, under torch.compile with CUDA graphs, are graph outputs overwritten by
+    the next replay (seen on the 3060 with mode="reduce-overhead"). REPA.forward builds it once per forward """
+    return create_block_mask(interleaved_causal_mask_mod, None, None, 2 * n, n, device=device)
+
 class MLP(nn.Module):
     def __init__(self, config: PretrainConfig, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -209,6 +287,7 @@ class REPALayer(nn.Module):
         # arch_query_mlp_width: the query stream gets its own MLP of this width instead of sharing self.mlp
         query_mlp_width = getattr(config, "arch_query_mlp_width", 0)
         self.query_mlp = MLP(config, query_mlp_width) if (config.use_query_stream and query_mlp_width) else None
+        self.kern_attn_fused = getattr(config, "kern_attn_fused", "") # getattr: older pickled configs
 
     def forward(
         self,
@@ -221,6 +300,7 @@ class REPALayer(nn.Module):
         is_causal: bool = False,
         content_needed: bool = True,
         w: Optional[torch.Tensor] = None,
+        flex_block_mask=None,
     ):
         """ h: [B,1+N,D], g: [B,N,D] or None
         is_causal: both streams have N rows and use causal attention without masks (perf_causal_no_mask)
@@ -231,32 +311,45 @@ class REPALayer(nn.Module):
         g_src = w if w is not None else g_in
         g_norm = self.ln1_g(g_src) if g is not None else None # before the content attention: keeps the op order
 
+        # kern_attn_fused: one attention call for both streams, only where it is the same math as the two calls below
+        # (both square causal without masks, both outputs needed, no attention dropout, which would draw differently)
+        fused = (self.kern_attn_fused and content_needed and g is not None and is_causal and attn_mask_h is None
+                 and attn_mask_g is None and (self.attention.attn_drop_p == 0.0 or not self.training))
+
         # self-attention
-        if content_needed:
-            h_attn, k, v = self.attention(
-                x_q=h_norm, x_kv=h_norm,
-                position_embeddings=position_embeddings_h,
-                attn_mask=attn_mask_h,
-                return_kv=True,
-                is_causal=is_causal and attn_mask_h is None,
+        if fused:
+            h_attn, g_attn = self.attention.fused_two_stream(
+                h_norm, g_norm, position_embeddings_h, position_embeddings_g, self.kern_attn_fused,
+                q_expand=tuple(g_in.shape[:2]) if w is not None else None, block_mask=flex_block_mask,
             )
             h = h_in + self.drop_path1(self.ls1_h(h_attn))
+            g = g_in + self.drop_path1(self.ls1_g(g_attn))
         else:
-            k, v = self.attention.project_kv(h_norm, position_embeddings_h)
+            if content_needed:
+                h_attn, k, v = self.attention(
+                    x_q=h_norm, x_kv=h_norm,
+                    position_embeddings=position_embeddings_h,
+                    attn_mask=attn_mask_h,
+                    return_kv=True,
+                    is_causal=is_causal and attn_mask_h is None,
+                )
+                h = h_in + self.drop_path1(self.ls1_h(h_attn))
+            else:
+                k, v = self.attention.project_kv(h_norm, position_embeddings_h)
 
-        if g is None: # content stream only
-            h = h + self.drop_path2(self.ls2_h(self.mlp(self.ln2_h(h))))
-            return h, None
+            if g is None: # content stream only
+                h = h + self.drop_path2(self.ls2_h(self.mlp(self.ln2_h(h))))
+                return h, None
 
-        g_attn = self.attention(
-            x_q=g_norm, x_kv=h_norm,
-            position_embeddings=position_embeddings_g,
-            attn_mask=attn_mask_g,
-            kv=(k, v),
-            is_causal=is_causal and attn_mask_g is None, # arch_predict_frac keeps an explicit (offset) query mask
-            q_expand=tuple(g_in.shape[:2]) if w is not None else None,
-        )
-        g = g_in + self.drop_path1(self.ls1_g(g_attn))
+            g_attn = self.attention(
+                x_q=g_norm, x_kv=h_norm,
+                position_embeddings=position_embeddings_g,
+                attn_mask=attn_mask_g,
+                kv=(k, v),
+                is_causal=is_causal and attn_mask_g is None, # arch_predict_frac keeps an explicit (offset) query mask
+                q_expand=tuple(g_in.shape[:2]) if w is not None else None,
+            )
+            g = g_in + self.drop_path1(self.ls1_g(g_attn))
 
         # mlp
         if content_needed:
@@ -290,9 +383,11 @@ class REPAEncoder(nn.Module):
         query_start: int = 0,
         h_add: Optional[torch.Tensor] = None,
         h_add_from: int = 0,
+        flex_block_mask=None,
     ):
         """ query_start: first layer that runs the query stream (arch_query_top_k); g is the query input at that layer
-        h_add: added to h before each layer from h_add_from on (arch_target_pos_layers) """
+        h_add: added to h before each layer from h_add_from on (arch_target_pos_layers)
+        flex_block_mask: kern_attn_fused="flex"'s block mask, shared by every layer """
         last = len(self.layers) - 1
         g_start, g = g, (g if query_start == 0 else None)
         for i, layer in enumerate(self.layers):
@@ -305,6 +400,7 @@ class REPAEncoder(nn.Module):
                 is_causal=is_causal,
                 content_needed=not (skip_last_content and i == last),
                 w=w if i == query_start else None,
+                flex_block_mask=flex_block_mask,
             )
         return h, g
 
@@ -443,6 +539,9 @@ class REPA(nn.Module):
             attn_mask_g = torch.tril(torch.ones(N - off, h0.shape[1], dtype=torch.bool, device=tgt.device), diagonal=off)
         L = len(self.encoder.layers)
         query_start = L - self.arch_query_top_k if (self.arch_query_top_k and two_stream) else 0
+        # kern_attn_fused="flex": one block mask per forward for all layers (built here, not cached across calls)
+        flex_block_mask = (interleaved_causal_block_mask(h0.shape[1], h0.device)
+                           if causal and not off and getattr(self.config, "kern_attn_fused", "") == "flex" else None)
 
         h, g = self.encoder(
             h0, g0,
@@ -454,6 +553,7 @@ class REPA(nn.Module):
             skip_last_content=skip_last_content,
             w=w,
             query_start=query_start,
+            flex_block_mask=flex_block_mask,
         )
 
         if g is None:

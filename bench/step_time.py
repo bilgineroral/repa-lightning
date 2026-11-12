@@ -63,6 +63,7 @@ def main():
     wall = timer.t1 - timer.t0 # covers the n timed steps plus the one stopping step
     result = {
         "model": args.model, "flags": flags, "arch": "" if args.arch in ("", "none") else args.arch,
+        "kern": "" if args.kern in ("", "none") else args.kern,
         "image_size": cfg.image_size, "batch": cfg.batch_size, "data": args.data,
         "data_root": args.data_root, "num_workers": args.num_workers if args.data == "real" else 0,
         "optimizer": optimizer, "accum": accum if optimizer else None, "precision": args.precision,

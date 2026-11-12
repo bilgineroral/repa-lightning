@@ -38,6 +38,16 @@ def gpu_processes():
     except Exception as e:
         return [f"nvidia-smi failed: {e}"]
 
+def kernel_family(names):
+    """ SDPA kernel names -> backend family. cudnn first: cuDNN's SDPA kernel names contain "flash" too
+    (cudnn_generated_fort_native_sdpa_sm80_flash_fprop_...), so checking flash first mislabelled cuDNN as flash """
+    n = " ".join(names).lower()
+    for fam, keys in (("cudnn", ("cudnn",)), ("flash", ("flash",)), ("mem_efficient", ("fmha", "efficient", "mem_eff")),
+                      ("math", ("softmax", "bmm", "gemm"))):
+        if any(k in n for k in keys):
+            return fam
+    return "unknown"
+
 def sdpa_backends(torch):
     """ which SDPA backends accept our attention calls (fwd + bwd, bf16), and which kernel runs by default """
     import warnings
@@ -57,14 +67,6 @@ def sdpa_backends(torch):
             mask = torch.tril(torch.ones(Nq, Nk, dtype=torch.bool, device="cuda"))
             o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[None, None])
         o.sum().backward()
-
-    def kernel_family(names):
-        n = " ".join(names).lower()
-        for fam, keys in (("flash", ("flash",)), ("cudnn", ("cudnn",)), ("mem_efficient", ("fmha", "efficient", "mem_eff")),
-                          ("math", ("softmax", "bmm", "gemm"))):
-            if any(k in n for k in keys):
-                return fam
-        return "unknown"
 
     cases = {}
     for model, H in (("S", 6), ("B", 12)):

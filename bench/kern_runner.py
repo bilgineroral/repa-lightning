@@ -57,6 +57,7 @@ class Step:
     fp8_recipe: str = "" # "", a recipe, or "@best"
     sdpa: str = "default"
     data: str = "synthetic"
+    kern: str = "" # --kern flags (config.py KERN_FLAGS)
     requires: list = field(default_factory=list) # "fp8", "templates", "data_root", "config:<field>"
     note: str = ""
 
@@ -81,11 +82,11 @@ def build_plan(models, dry_run):
     for m in models:
         for b in ("cudnn", "efficient"): # flash is the default backend (step 02 default)
             plan.append(Step(f"05_sdpa_{m}_{b}", "time", m, mode="@best", fp8_recipe="@best", sdpa=b))
-        plan.append(Step(f"05_patch_linear_{m}", "time", m, mode="@best", fp8_recipe="@best",
+        plan.append(Step(f"05_patch_linear_{m}", "time", m, mode="@best", fp8_recipe="@best", kern="patch_linear",
                          requires=["config:kern_patch_linear"]))
         for v in ("gqa", "flex"):
             plan.append(Step(f"05_attn_fused_{v}_{m}", "time", m, mode="@best", fp8_recipe="@best",
-                             requires=["config:kern_attn_fused"], note=f"kern_attn_fused={v}"))
+                             kern=f"attn_fused={v}", requires=["config:kern_attn_fused"]))
     for m in models:
         for d in ("synthetic", "real"):
             plan.append(Step(f"06_data_{m}_{d}", "time", m, mode="@best", fp8_recipe="@best", data=d,
@@ -98,6 +99,9 @@ def build_plan(models, dry_run):
 
 def unmet(step, hw, args, config_fields):
     """ -> reason the step can't run here, or None """
+    for pattern in getattr(args, "skip", None) or []:
+        if re.search(pattern, step.id):
+            return f"--skip {pattern}"
     for r in step.requires:
         if r == "not_dry_run" and args.dry_run:
             return "dry run: sm_89-only step"
@@ -149,7 +153,8 @@ def best_overall(results, model):
 
 def resolve(step, results):
     """ concrete settings for a step whose mode / FP8 recipe is '@best' """
-    s = {"mode": step.mode, "coord_descent": step.coord_descent, "fp8_recipe": step.fp8_recipe, "flags": step.flags}
+    s = {"mode": step.mode, "coord_descent": step.coord_descent, "fp8_recipe": step.fp8_recipe, "flags": step.flags,
+         "kern": step.kern}
     if step.fp8_recipe == "@best":
         b = best_overall(results, step.model)
         s.update(mode=b["mode"], coord_descent=b["coord_descent"], fp8_recipe=b["fp8_recipe"], best_from=b["from"])
@@ -202,7 +207,9 @@ class Runner:
 
     def batch_accum(self, model):
         batch = {"S": self.args.batch_s, "B": self.args.batch_b}[model]
-        return batch, max(1, self.args.global_batch // batch)
+        # dry run: accumulation 2, so the few steps include optimizer steps (fused AdamW, grad zeroing under CUDA graphs)
+        global_batch = self.args.global_batch or (2 * batch if self.args.dry_run else 4096)
+        return batch, max(1, global_batch // batch)
 
     def command(self, step, s, raw):
         if step.kind == "preflight":
@@ -213,6 +220,8 @@ class Runner:
         steps = self.args.profile_steps if step.kind == "profile" else self.args.steps
         inner = ["--model", step.model, "--flags", s["flags"], "--batch", str(batch), "--warmup", str(warmup),
                  "--steps", str(steps), "--out", raw]
+        if s.get("kern"):
+            inner += ["--kern", s["kern"]]
         if step.kind == "time":
             inner += ["--optimizer", "--accum", str(accum), "--data", step.data]
             if step.data == "real":
@@ -232,10 +241,7 @@ class Runner:
             shutil.rmtree(raw)
         os.makedirs(raw)
         cmd = self.command(step, s, raw)
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=self.args.gpu_visible,
-                   # one Inductor cache per step: the FX graph cache key ignores SDPA backend toggles, so a shared cache
-                   # replays another step's compiled attention (seen locally: efficient reused cudnn's graph)
-                   TORCHINDUCTOR_CACHE_DIR=os.path.join(self.run_dir, "inductor_cache", step.id))
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=self.args.gpu_visible, **cache_env(self.run_dir, s, step.sdpa))
         log_path = os.path.join(self.run_dir, "logs", f"{step.id}.log")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         before = snapshot(self.args.gpu)
@@ -289,6 +295,26 @@ class Runner:
             return None
         with open(p) as f:
             return json.load(f)
+
+def cache_family(settings):
+    """ Inductor cache directory name for a step's settings. Modes that differ only in CUDA graphs share one: CUDA
+    graphs are applied after compilation, the compiled kernels and GEMM autotune results are the same, and the FX graph
+    cache key includes the cudagraphs option anyway. Coordinate descent gets its own directory, so its tuned kernel
+    configs never leak into the steps without it. """
+    family = {"default": "default", "reduce-overhead": "default", "max-autotune": "max-autotune",
+              "max-autotune-no-cudagraphs": "max-autotune"}[settings["mode"]]
+    return family + ("+cd" if settings.get("coord_descent") else "")
+
+def cache_env(run_dir, settings, sdpa):
+    """ environment for a step's Inductor caches, shared by every step with the same cache_family, so max-autotune
+    benchmarks each GEMM shape once per run instead of once per step. The FX graph and AOTAutograd cache keys ignore the
+    SDPA backend toggles (seen on the 3060: an "efficient" step replayed the cudnn step's compiled graph), so steps with
+    a non-default SDPA backend turn those two caches off: they still reuse the GEMM autotune results (keyed by kernel
+    and shape) but compile their own graphs. """
+    env = {"TORCHINDUCTOR_CACHE_DIR": os.path.join(run_dir, "inductor_cache", cache_family(settings))}
+    if sdpa != "default":
+        env.update(TORCHINDUCTOR_FX_GRAPH_CACHE="0", TORCHINDUCTOR_AUTOGRAD_CACHE="0")
+    return env
 
 def kill_group(proc):
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -357,6 +383,8 @@ def describe(step, s):
             parts.append(f"sdpa {step.sdpa}")
         if step.data != "synthetic":
             parts.append(f"data {step.data}")
+        if s.get("kern"):
+            parts.append(f"kern {s['kern']}")
         if step.note:
             parts.append(step.note)
     return ", ".join(parts) or step.kind
@@ -440,6 +468,7 @@ def summary_rows(plan, results, states):
                 f"{s.get('mode')}{' +cd' if s.get('coord_descent') else ''}"
                 + (f", fp8 {s['fp8_recipe']}" if s.get("fp8_recipe") else "")
                 + (f", sdpa {step.sdpa}" if step.sdpa != "default" else "")
+                + (f", kern {s['kern']}" if s.get("kern") else "")
                 + (f", {step.data}" if step.data != "synthetic" else ""))
             if step.kind == "profile":
                 b = r.get("buckets_pct_of_kernel_time", {})
@@ -517,13 +546,16 @@ def parse_args(argv=None):
     p.add_argument("--models", nargs="+", choices=["S", "B"], default=None, help="default S B (dry run: S)")
     p.add_argument("--batch-s", type=int, default=None, help="per-GPU batch for S (default 256; dry run 32)")
     p.add_argument("--batch-b", type=int, default=None, help="per-GPU batch for B (default 128; dry run 16)")
-    p.add_argument("--global-batch", type=int, default=4096, help="gradient accumulation = global / batch, as config.py")
+    p.add_argument("--global-batch", type=int, default=None,
+                   help="gradient accumulation = global / batch (default 4096 as config.py; dry run 2 x batch)")
     p.add_argument("--warmup", type=int, default=None, help="untimed steps (default 20; dry run 3)")
     p.add_argument("--steps", type=int, default=None, help="timed steps (default 100; dry run 5)")
     p.add_argument("--profile-steps", type=int, default=None, help="profiled steps (default 10; dry run 3)")
     p.add_argument("--step-timeout", type=int, default=None, help="seconds per step (default 5400; dry run 1200)")
     p.add_argument("--data-root", default=env("DATA_ROOT") or None, help="ImageFolder root for the real-data step")
     p.add_argument("--num-workers", type=int, default=int(env("NUM_WORKERS") or 8))
+    p.add_argument("--skip", nargs="*", default=[], metavar="REGEX",
+                   help="don't run steps whose id matches, e.g. 'max-autotune\\+cd' to fit a time budget")
     p.add_argument("--preflight-json", default=None, help="kern_preflight.py report (copied into the run dir)")
     p.add_argument("--python", default=sys.executable, help="python of the benchmark env (default: this one)")
     a = p.parse_args(argv)

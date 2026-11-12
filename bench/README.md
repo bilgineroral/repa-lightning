@@ -21,6 +21,22 @@ Except for `fp8`, the model and loss are unchanged: same parameters, same checkp
 check equal loss and gradients. Equality is exact up to float rounding only with drop path 0 (the default). With
 drop path, `skip_last_content` changes the order of random draws.
 
+## Kernel flags (same model, Tier 3)
+
+Like the perf flags: the model, its parameters and checkpoints don't change, the flags are off by default, and
+`tests/test_kern_equivalence.py` checks fp32 loss and gradients against the current path (rtol 1e-5). Set them with
+`--kern` in the bench scripts, comma separated `name[=value]`. Config fields are `kern_<name>`.
+
+| `--kern` | what it does | config field |
+|---|---|---|
+| `patch_linear` | Patch embedding as reshape + one GEMM (`F.linear` with the conv weight viewed as `[D, C*p*p]`) instead of the stride-16 Conv2d. Falls back to the conv when the image side isn't a multiple of the patch size. | `kern_patch_linear` |
+| `attn_fused=gqa` | Both streams' attention in one SDPA call over the shared K/V: queries stacked as 2H heads with `enable_gqa=True`. Needs `causal_no_mask`; elsewhere (masks, the last layer with `skip_last_content`, attention dropout in training) the two calls run as before. | `kern_attn_fused` |
+| `attn_fused=flex` | The same with FlexAttention: queries interleaved as 2N rows (content t, query t) and the block mask `q // 2 >= kv`, so every K/V tile serves both streams. Needs `torch.compile` for the Triton kernel (eager mode runs a slow reference). | `kern_attn_fused` |
+
+```bash
+python bench/step_time.py --model S --flags all --kern patch_linear,attn_fused=flex
+```
+
 ## Architecture flags (these change the model)
 
 Speed-only benchmarks of the report's alternatives. They **change the model**, so there are no equivalence tests. The
@@ -150,7 +166,10 @@ bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake --num-workers 4
    - `05` SDPA cudnn / efficient, plus `kern_patch_linear` / `kern_attn_fused` once `config.py` has them
    - `06` real vs synthetic data
 
-   Compile mode, FP8 recipe and SDPA backend are applied by `bench/kern_step.py` without changing the model code. Each step gets its own Inductor cache, because the FX graph cache ignores the SDPA toggles.
+   Compile mode, FP8 recipe and SDPA backend are applied by `bench/kern_step.py` without changing the model code; the
+   `kern_*` steps pass `--kern`.
+
+   Inductor caches are shared per family: default and reduce-overhead together, max-autotune and max-autotune-no-cudagraphs together, and each +cd variant separately. So max-autotune benchmarks each GEMM shape once per run, not once per step. Steps with a non-default SDPA backend keep the family's GEMM autotune results but turn off the FX graph and AOTAutograd caches, because those cache keys ignore the SDPA toggles.
 3. Results go to `bench/results/<run_id>/<step>.json`, together with nvidia-smi and system-load snapshots from before and after the step. A rerun with the same `--run-id` skips finished steps; the default id is fixed per host, GPU and dry/full. Failed steps write `<step>.failed.json` and are retried next time.
 4. Each step has a timeout: `--step-timeout`, default 5400 s (dry run 1200 s).
 5. At the end, `summary.md` / `summary.json` and `rerank.json` are written to the run directory.
@@ -204,4 +223,5 @@ The fake JPEGs have realistic sizes, so decode cost is similar, but the content 
 
 ## Tier 3
 
-Custom-kernel plans (not implemented): `bench/TIER3.md`.
+Custom-kernel plans: `bench/TIER3.md` and `~/repa-notes/kernel_research.md`. Implemented so far: the kernel flags
+above (`kern_patch_linear`, `kern_attn_fused`).
