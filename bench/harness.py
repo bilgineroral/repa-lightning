@@ -15,6 +15,7 @@ from pytorch_lightning.callbacks import Callback
 
 from config import PERF_FLAGS, PretrainConfig, PretrainConfigSmall, parse_arch_flags, parse_kern_flags, parse_perf_flags
 from dataset import IMAGE_MEAN, IMAGE_STD, ImageNetDataModule, PretrainDataset
+from optim import hf_accumulation_scale
 from repa import LitREPA
 
 def add_common_args(p):
@@ -111,7 +112,11 @@ class StopAfter(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.seen += 1
-        self.losses.append(outputs["loss"].detach().float())
+        # outputs["loss"] is Lightning's closure loss: training_step's return (loss * hf_accumulation_scale) divided by
+        # accumulate_grad_batches. Undo both, so loss_first / loss_last are the prediction loss itself
+        accum = trainer.accumulate_grad_batches
+        scale = hf_accumulation_scale(batch_idx, trainer.num_training_batches, accum)
+        self.losses.append(outputs["loss"].detach().float() * (accum / scale))
         if self.seen >= self.n:
             trainer.should_stop = True
 
