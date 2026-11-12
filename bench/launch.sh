@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start bench/run_all.sh in the background: a Slurm job if sbatch exists, else a tmux session, else nohup.
+# Start bench/run_all.sh (the Tier 3 runner) in the background: a Slurm job if sbatch exists, else a tmux session,
+# else nohup. run_all.sh takes the GPU from CUDA_VISIBLE_DEVICES set here (or by Slurm).
 #   DATA_ROOT=$HOME/imagenet bash bench/launch.sh
 # ---- edit these if needed ----
 GPUS=1                       # the benchmarks use one GPU
@@ -21,7 +22,7 @@ if command -v sbatch >/dev/null 2>&1; then
   job=${out##* }
   echo "Check progress:"
   echo "  squeue -u $USER"
-  echo "  tail -f $LAUNCH_LOG_DIR/$JOB_NAME-$job.log        # or bench/results/latest/run_all.log once it starts"
+  echo "  tail -f $LAUNCH_LOG_DIR/$JOB_NAME-$job.log        # or bench/results/kern-*/runner.log once it starts"
   echo "Cancel: scancel $job"
   exit 0
 fi
@@ -44,12 +45,12 @@ if command -v tmux >/dev/null 2>&1; then
   tmux new-session -d -s "$session" "cd '$PWD' && $cmd"
   echo "Started in tmux session '$session' on GPU $GPU."
   echo "Check progress:"
-  echo "  tail -f $log          # or bench/results/latest/run_all.log"
+  echo "  tail -f $log          # or bench/results/kern-*/runner.log"
   echo "  tmux attach -t $session   (detach again with Ctrl-b d)"
 else
   nohup bash -c "$cmd" >/dev/null 2>&1 &
   echo "Started with nohup (pid $!) on GPU $GPU."
   echo "Check progress:"
-  echo "  tail -f $log          # or bench/results/latest/run_all.log"
+  echo "  tail -f $log          # or bench/results/kern-*/runner.log"
   echo "  ps -p $!"
 fi

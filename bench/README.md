@@ -50,7 +50,7 @@ MODELS=S BATCH_S=128 ACCUM_S=32 bash bench/run_arch.sh
 ```
 
 This runs each setting alone and with all Tier 1 perf flags, plus both baselines, on synthetic data with the
-optimizer on. `run_all.sh` runs it after the Tier 1 matrix; results go to `bench/results/<timestamp>/arch/` and
+optimizer on. `run_tier12.sh` runs it after the Tier 1 matrix; results go to `bench/results/<timestamp>/arch/` and
 `summary_arch.md`.
 
 ## On Arcturus, from a fresh login
@@ -88,7 +88,8 @@ partition are variables at the top of `bench/launch.sh`. The script prints how t
 DATA_ROOT=$HOME/imagenet bash bench/launch.sh
 ```
 
-`run_all.sh` runs, in order:
+`launch.sh` starts `run_all.sh`, the Tier 3 runner (next section). The Tier 1/2 run that used to be `run_all.sh` is
+now `bench/run_tier12.sh`; start it by hand (`DATA_ROOT=$HOME/imagenet bash bench/run_tier12.sh`). It runs, in order:
 1. preflight
 2. the full pytest suite
 3. a batch-size probe for S and B: the config batch (256 / 128), halved until it fits, checked with all flags too.
@@ -99,7 +100,7 @@ DATA_ROOT=$HOME/imagenet bash bench/launch.sh
    a message
 7. the architecture-flag runs (`bench/run_arch.sh`)
 
-Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_all.log`), the
+Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_tier12.log`), the
 preflight JSON, the chosen batch sizes (`batch_sizes.txt`), one JSON per run, profiles and Chrome traces. A failed
 step doesn't stop the rest; failures are listed at the end of the log.
 
@@ -123,6 +124,38 @@ To regenerate it: `python bench/summarize.py --results bench/results/latest/tier
   users' jobs can still start later and slow the timings.
 - Don't modify a shared or someone else's `repa` env. Use `ENV_NAME=repa-bench`.
 - Don't commit results. `bench/results/` is git-ignored.
+
+## Tier 3 runner (`run_all.sh`)
+
+The benchmark sequence of `~/repa-notes/kernel_research.md` section 5, on one GPU:
+
+```bash
+bash bench/run_all.sh --gpu 0 --data-root $HOME/imagenet
+```
+
+```bash
+bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake --num-workers 4
+```
+
+1. `bench/kern_preflight.py` (no conda env needed) reads the GPU through `nvidia-smi`.
+   - Compute capability 8.9 (RTX 6000 Ada) is expected; anything else is a warning.
+   - The driver version picks the conda env: >= 580 uses `repa-kern` (CUDA 13), 525-579 uses `repa-kern-cu126`. See `~/repa-notes/env/README.md`. `ENV_NAME=...` overrides the choice.
+   - It refuses a busy GPU (other processes, memory in use > 2 GiB, or utilization > 20%) unless `--force`.
+2. `bench/kern_runner.py` runs the steps with that env's python and `CUDA_VISIBLE_DEVICES=<gpu>`:
+   - `00` torch preflight
+   - `01` profile, default compile
+   - `02` compile modes: default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs, and coordinate descent
+   - `03` FP8 recipes, with default compile and with the best mode
+   - `04` profile with the best settings, plus the re-rank rule
+   - `05` SDPA cudnn / efficient, plus `kern_patch_linear` / `kern_attn_fused` once `config.py` has them
+   - `06` real vs synthetic data
+
+   Compile mode, FP8 recipe and SDPA backend are applied by `bench/kern_step.py` without changing the model code. Each step gets its own Inductor cache, because the FX graph cache ignores the SDPA toggles.
+3. Results go to `bench/results/<run_id>/<step>.json`, together with nvidia-smi and system-load snapshots from before and after the step. A rerun with the same `--run-id` skips finished steps; the default id is fixed per host, GPU and dry/full. Failed steps write `<step>.failed.json` and are retried next time.
+4. Each step has a timeout: `--step-timeout`, default 5400 s (dry run 1200 s).
+5. At the end, `summary.md` / `summary.json` and `rerank.json` are written to the run directory.
+
+`--dry-run` is for the local 3060: S only, batch 32, 3 + 5 steps. It always skips the sm_89-only steps (FP8, max-autotune GEMM templates). Full-run steps that the hardware can't do (capability < 8.9, fewer than 68 SMs, no `--data-root`) are listed as "not run" and no JSON is written for them.
 
 ## Running parts by hand
 
