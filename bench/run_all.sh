@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 3 benchmark sequence on one GPU (~/repa-notes/kernel_research.md section 5): preflight, profiles, compile
+# Tier 3 benchmark sequence on one GPU (bench/KERNEL_PLAN.md section 5): preflight, profiles, compile
 # modes, FP8 recipes, best-settings profile + re-rank rule, SDPA backends, real vs synthetic data.
 #   bash bench/run_all.sh --gpu 0 [--data-root $HOME/imagenet]       # full run (Arcturus, RTX 6000 Ada)
 #   bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake  # local check (RTX 3060)

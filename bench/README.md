@@ -79,13 +79,16 @@ Run these from the repo root, in order.
 cd ~/repa-lightning && git fetch origin && git checkout repa-speedup && git pull
 ```
 
-**2. Environment (once).** If a conda env named `repa` already exists, this only reports its versions and changes
-nothing. If it's missing packages, or isn't yours, the script prints what to do (for example
-`ENV_NAME=repa-bench bash bench/setup_env.sh`, then pass the same `ENV_NAME` to the next steps).
+**2. Environment (once).** The Tier 3 runner (`run_all.sh`) uses the conda env `repa-kern`. If it already exists,
+this only reports its versions and changes nothing; if it's missing packages, the script prints what to do.
 
 ```bash
-bash bench/setup_env.sh
+ENV_NAME=repa-kern bash bench/setup_env.sh
 ```
+
+If the driver is 525-579 (CUDA 12 only; check with `nvidia-smi`), build the `repa-kern-cu126` fallback instead, as in
+`bench/ENV.md`. `run_all.sh`'s preflight reads the driver version and picks `repa-kern` (>= 580) or `repa-kern-cu126`
+(525-579) automatically.
 
 **3. Preflight.** Reports GPUs (name, count, capability, memory, other processes), torch and CUDA versions, which
 attention kernel actually runs for our shapes, whether FP8 is possible, `sbatch`, CPUs and free disk. It also checks
@@ -143,7 +146,7 @@ To regenerate it: `python bench/summarize.py --results bench/results/latest/tier
 
 ## Tier 3 runner (`run_all.sh`)
 
-The benchmark sequence of `~/repa-notes/kernel_research.md` section 5, on one GPU:
+The benchmark sequence of `bench/KERNEL_PLAN.md` section 5, on one GPU:
 
 ```bash
 bash bench/run_all.sh --gpu 0 --data-root $HOME/imagenet
@@ -155,7 +158,7 @@ bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake --num-workers 4
 
 1. `bench/kern_preflight.py` (no conda env needed) reads the GPU through `nvidia-smi`.
    - Compute capability 8.9 (RTX 6000 Ada) is expected; anything else is a warning.
-   - The driver version picks the conda env: >= 580 uses `repa-kern` (CUDA 13), 525-579 uses `repa-kern-cu126`. See `~/repa-notes/env/README.md`. `ENV_NAME=...` overrides the choice.
+   - The driver version picks the conda env: >= 580 uses `repa-kern` (CUDA 13), 525-579 uses `repa-kern-cu126`. See `bench/ENV.md`. `ENV_NAME=...` overrides the choice.
    - It refuses a busy GPU (other processes, memory in use > 2 GiB, or utilization > 20%) unless `--force`.
 2. `bench/kern_runner.py` runs the steps with that env's python and `CUDA_VISIBLE_DEVICES=<gpu>`:
    - `00` torch preflight
@@ -223,5 +226,5 @@ The fake JPEGs have realistic sizes, so decode cost is similar, but the content 
 
 ## Tier 3
 
-Custom-kernel plans: `bench/TIER3.md` and `~/repa-notes/kernel_research.md`. Implemented so far: the kernel flags
+Custom-kernel plans: `bench/TIER3.md` and `bench/KERNEL_PLAN.md`. Implemented so far: the kernel flags
 above (`kern_patch_linear`, `kern_attn_fused`).

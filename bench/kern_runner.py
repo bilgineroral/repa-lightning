@@ -1,5 +1,5 @@
 """
-Tier 3 benchmark sequence (~/repa-notes/kernel_research.md section 5) on one GPU. Started by bench/run_all.sh, which
+Tier 3 benchmark sequence (bench/KERNEL_PLAN.md section 5) on one GPU. Started by bench/run_all.sh, which
 runs bench/kern_preflight.py first (GPU, driver -> conda env, idle check) and then this script with the env's python.
 
 Steps, in the doc's order (S and B unless --models):
@@ -8,7 +8,7 @@ Steps, in the doc's order (S and B unless --models):
   02 compile modes          default / reduce-overhead / max-autotune / max-autotune-no-cudagraphs, + coordinate descent
   03 FP8 recipes            tensorwise / rowwise / rowwise_with_gw_hp, with default compile and with the best 02 mode
   04 profile, best          best of 02-03, then the re-rank rule (memory-bound groups > 5% of kernel time move up)
-  05 ranks 3-5              SDPA backend (cudnn, efficient); kern_patch_linear / kern_attn_fused once config.py has them
+  05 ranks 3-5              SDPA backend (cudnn, efficient), kern_patch_linear, kern_attn_fused (gqa, flex)
   06 data                   real vs synthetic data with the best settings (needs --data-root)
 Each step writes <results>/<run_id>/<step>.json and is skipped when that file exists (resumable). A failed step writes
 <step>.failed.json instead and is retried on the next run. Every result records nvidia-smi and system load snapshots.

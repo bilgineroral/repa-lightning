@@ -3,7 +3,7 @@ Tier 3 runner preflight (called by bench/run_all.sh before any conda env is chos
 with any python3. Queries nvidia-smi for the target GPU and decides:
   - compute capability: 8.9 (RTX 6000 Ada) expected; anything else is a warning, not an error
   - driver version -> conda env: >= 580 runs CUDA 13 builds (repa-kern), 525-579 needs CUDA 12 builds (repa-kern-cu126),
-    < 525 is unsupported (CUDA 13.0 release notes, see ~/repa-notes/env/README.md)
+    < 525 is unsupported (CUDA 13.0 release notes, see bench/ENV.md)
   - idle / busy: other compute processes on the GPU abort the run. Where nvidia-smi can't list processes (WSL), memory
     in use above --busy-mem-mib or utilization above --busy-util also counts as busy.
 
@@ -132,7 +132,7 @@ def main(argv=None):
     py = conda_env_python(env)
     report["python"] = py
     if py is None:
-        report["problems"].append(f"conda env '{env}' not found: create it as in ~/repa-notes/env/README.md")
+        report["problems"].append(f"conda env '{env}' not found: create it as in bench/ENV.md")
         return _finish(report, args, 3)
 
     busy = is_busy(info["processes"], info["memory_used_mib"], info["utilization_pct"], args.busy_mem_mib, args.busy_util)
