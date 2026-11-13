@@ -3,6 +3,8 @@ Tier 3 benchmark sequence (bench/KERNEL_PLAN.md section 5) on one GPU. Started b
 runs bench/kern_preflight.py first (GPU, driver -> conda env, idle check) and then this script with the env's python.
 
 Steps, in the doc's order (S and B unless --models):
+  00 vanilla                base REPA, no Tier 1 flags, default compile (step_time.py --flags none, the vanilla arm of
+                            bench/run_tier1.sh): the reference for loss_vs_vanilla and speedup_vs_vanilla
   00 torch preflight        bench/preflight.py: versions, SDPA dispatch, DATA_ROOT layout
   01 profile, default       all Tier 1 flags, default torch.compile
   02 compile modes          default / reduce-overhead / max-autotune / max-autotune-no-cudagraphs, + coordinate descent
@@ -61,8 +63,12 @@ class Step:
     requires: list = field(default_factory=list) # "fp8", "templates", "data_root", "config:<field>"
     note: str = ""
 
+LOSS_TOL_FP8, LOSS_TOL = 0.05, 0.01 # |loss_vs_vanilla| above these is flagged in the summary
+
 def build_plan(models, dry_run):
-    plan = [Step("00_preflight", "preflight")]
+    # vanilla first: the reference every other step's loss and speed is compared with
+    plan = [Step(f"00_vanilla_{m}", "time", m, flags="none") for m in models]
+    plan.append(Step("00_preflight", "preflight"))
     for m in models:
         plan.append(Step(f"01_profile_{m}_default", "profile", m))
     for m in models:
@@ -455,7 +461,24 @@ def rerank(run_dir, models):
 
 # ---------------------------------------------------------------- summary
 
+def vs_vanilla(step, rec, results):
+    """ (final loss, loss_vs_vanilla, speedup_vs_vanilla, flagged) of a time step vs 00_vanilla_<model>; None where it
+    doesn't apply or the vanilla step is missing or failed. Flagged: |loss_vs_vanilla| above LOSS_TOL_FP8 for FP8
+    steps, LOSS_TOL otherwise """
+    r = (rec or {}).get("result") or {}
+    loss = r.get("loss_last") if step.kind == "time" else None
+    van = results.get(f"00_vanilla_{step.model}")
+    vr = ((van or {}).get("result") or {}) if (van or {}).get("status") == "ok" else {}
+    v_loss, v_ms = vr.get("loss_last"), vr.get("ms_per_step_median")
+    rel = (loss - v_loss) / abs(v_loss) if (loss is not None and v_loss) else None
+    speed = v_ms / r["ms_per_step_median"] if (step.kind == "time" and v_ms and r.get("ms_per_step_median")) else None
+    fp8 = "fp8" in str(((rec or {}).get("settings") or {}).get("flags", "")).split(",")
+    flagged = rel is not None and abs(rel) > (LOSS_TOL_FP8 if fp8 else LOSS_TOL)
+    return loss, rel, speed, flagged
+
 def summary_rows(plan, results, states):
+    """ one row per step: [id, status, model, settings, ms/step, img/s, peak GiB, speedup (vs 02 default), run s,
+    note, loss, loss_vs_vanilla, speedup_vs_vanilla, loss_flagged] """
     rows = []
     for step in plan:
         rec = results.get(step.id)
@@ -465,7 +488,8 @@ def summary_rows(plan, results, states):
             base = results.get(f"02_compile_{step.model}_default")
             speed = (ms(base) / r["ms_per_step_median"]) if (base and ms(base) and r.get("ms_per_step_median")) else None
             setting = "" if step.kind == "preflight" else (
-                f"{s.get('mode')}{' +cd' if s.get('coord_descent') else ''}"
+                ("no Tier 1 flags, " if s.get("flags") in ("", "none") else "")
+                + f"{s.get('mode')}{' +cd' if s.get('coord_descent') else ''}"
                 + (f", fp8 {s['fp8_recipe']}" if s.get("fp8_recipe") else "")
                 + (f", sdpa {step.sdpa}" if step.sdpa != "default" else "")
                 + (f", kern {s['kern']}" if s.get("kern") else "")
@@ -482,9 +506,11 @@ def summary_rows(plan, results, states):
                     note += "; peak GiB excludes CUDA-graph memory" # timed steps reset the peak counter
             rows.append([step.id, "ok" if state != "done" else "ok (earlier run)", step.model, setting,
                          r.get("ms_per_step_median") if step.kind == "time" else (r.get("gpu_span_ms_per_step") if step.kind == "profile" else None),
-                         r.get("imgs_per_sec"), r.get("peak_mem_gib"), speed, rec.get("duration_s"), note])
+                         r.get("imgs_per_sec"), r.get("peak_mem_gib"), speed, rec.get("duration_s"), note,
+                         *vs_vanilla(step, rec, results)])
         else:
-            rows.append([step.id, state or "not run", step.model, "", None, None, None, None, None, detail])
+            rows.append([step.id, state or "not run", step.model, "", None, None, None, None, None, detail,
+                         None, None, None, False])
     return rows
 
 def fmt(v, nd=1):
@@ -498,12 +524,22 @@ def summary_markdown(rows, hw, args, rr, elapsed):
              f"physical GPU {args.gpu}, {'DRY RUN' if args.dry_run else 'full run'}, models {' '.join(args.models)}, "
              f"warmup {args.warmup}, steps {args.steps}. This invocation: {elapsed / 60:.1f} min.", "",
              "ms/step: median step time (time steps) or GPU span per step (profile steps). "
-             "Speedup: vs `02_compile_<model>_default`.", "",
-             "| step | status | model | settings | ms/step | img/s | peak GiB | speedup | run s | note |",
-             "|---|---|---|---|---:|---:|---:|---:|---:|---|"]
+             "Speedup: vs `02_compile_<model>_default` (all Tier 1 flags, default compile). "
+             "loss: final step's loss. vs vanilla: against `00_vanilla_<model>` (no Tier 1 flags, default compile; "
+             f"same batch, steps and seed); a loss difference above {LOSS_TOL:.0%} ({LOSS_TOL_FP8:.0%} for FP8) is "
+             "marked FLAG. n/a: not a timed step, or no successful vanilla step.", "",
+             "| step | status | model | settings | ms/step | img/s | peak GiB | speedup | speedup vs vanilla | loss "
+             "| loss vs vanilla | run s | note |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for r in rows:
+        rel = "n/a" if r[11] is None else f"{r[11]:+.2%}" + (" FLAG" if r[13] else "")
+        svv = "n/a" if r[12] is None else f"{r[12]:.3f}x"
+        loss = "n/a" if r[10] is None else f"{r[10]:.4f}"
         lines.append("| " + " | ".join([r[0], r[1], r[2], r[3], fmt(r[4]), fmt(r[5], 0), fmt(r[6], 2),
-                                         fmt(r[7], 3) + ("x" if r[7] else ""), fmt(r[8], 0), r[9]]) + " |")
+                                         fmt(r[7], 3) + ("x" if r[7] else ""), svv, loss, rel, fmt(r[8], 0),
+                                         r[9]]) + " |")
+    flagged = [r[0] for r in rows if r[13]]
+    lines += ["", f"Loss flags: {', '.join(flagged) if flagged else 'none'}."]
     lines += ["", "## Re-rank rule (memory-bound groups above 5% of kernel time in the best profile)", ""]
     if not rr:
         lines.append("No `04_profile_*_best` profile yet.")
@@ -616,7 +652,10 @@ def main(argv=None):
     md = summary_markdown(rows, hw, args, rr, time.time() - t0)
     with open(os.path.join(run_dir, "summary.md"), "w") as f:
         f.write(md)
-    write_json(os.path.join(run_dir, "summary.json"), {"rows": rows, "rerank": rr, "hardware": hw,
+    columns = ["step", "status", "model", "settings", "ms_per_step", "imgs_per_sec", "peak_gib", "speedup",
+               "run_s", "note", "loss", "loss_vs_vanilla", "speedup_vs_vanilla", "loss_flagged"]
+    write_json(os.path.join(run_dir, "summary.json"), {"columns": columns, "rows": [dict(zip(columns, r)) for r in rows],
+                                                       "rerank": rr, "hardware": hw,
                                                        "best": {m: best_overall(results, m) for m in args.models}})
     print("\n" + md)
     failed = [k for k, (st, _) in states.items() if st == "failed"]

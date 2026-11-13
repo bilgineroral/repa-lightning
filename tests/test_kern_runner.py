@@ -151,3 +151,54 @@ def test_skip_patterns():
     args = SimpleNamespace(dry_run=False, data_root=None, skip=[r"max-autotune\+cd"])
     assert kr.unmet(kr.Step("02_compile_S_max-autotune+cd", "time", "S"), hw, args, set()).startswith("--skip")
     assert kr.unmet(kr.Step("02_compile_S_max-autotune", "time", "S"), hw, args, set()) is None
+
+def test_vanilla_steps_first():
+    plan = kr.build_plan(["S", "B"], dry_run=True)
+    assert [s.id for s in plan[:3]] == ["00_vanilla_S", "00_vanilla_B", "00_preflight"]
+    v = plan[0]
+    assert v.kind == "time" and v.flags == "none" and v.mode == "default" and not v.requires # runs in a dry run too
+    hw, args = {"capability": [8, 6], "sms": 28}, SimpleNamespace(dry_run=True, data_root=None, skip=[r"vanilla"])
+    assert kr.unmet(v, hw, args, set()).startswith("--skip") # honors --skip like every step
+    runner = kr.Runner(SimpleNamespace(batch_s=32, batch_b=16, global_batch=None, warmup=3, steps=5, profile_steps=3,
+                                       data_root=None, num_workers=4, dry_run=True), hw, "python", "/tmp/x", print)
+    cmd = runner.command(v, kr.resolve(v, {}), "/tmp/x/raw")
+    assert cmd[cmd.index("--flags") + 1] == "none" and cmd[cmd.index("--mode") + 1] == "default"
+    assert "--kern" not in cmd and "--fp8-recipe" not in cmd
+
+def _rec(flags, ms_, loss, status="ok"):
+    return {"status": status, "settings": {"flags": flags, "mode": "default"},
+            "result": {"ms_per_step_median": ms_, "loss_last": loss}}
+
+def test_loss_and_speed_vs_vanilla():
+    step = kr.Step("05_x_S", "time", "S")
+    res = {"00_vanilla_S": _rec("none", 120.0, 1.0)}
+    loss, rel, speed, flag = kr.vs_vanilla(step, _rec("all", 100.0, 1.005), res)
+    assert loss == 1.005 and abs(rel - 0.005) < 1e-12 and abs(speed - 1.2) < 1e-12 and not flag
+    assert kr.vs_vanilla(step, _rec("all", 100.0, 1.02), res)[3] # 2% > 1% for non-FP8
+    assert not kr.vs_vanilla(step, _rec("all,fp8", 100.0, 1.02), res)[3] # within FP8's 5%
+    assert kr.vs_vanilla(step, _rec("all,fp8", 100.0, 1.06), res)[3]
+    # vanilla missing or failed: n/a, no crash
+    for r in ({}, {"00_vanilla_S": _rec("none", 120.0, 1.0, status="failed")}):
+        assert kr.vs_vanilla(step, _rec("all", 100.0, 1.0), r) == (1.0, None, None, False)
+    prof = kr.Step("04_profile_S_best", "profile", "S") # profile steps have no loss / step time to compare
+    assert kr.vs_vanilla(prof, {"status": "ok", "result": {}}, res) == (None, None, None, False)
+
+def test_summary_markdown_columns_without_vanilla():
+    plan = [kr.Step("00_vanilla_S", "time", "S", flags="none"), kr.Step("02_compile_S_default", "time", "S")]
+    rows = kr.summary_rows(plan, {"02_compile_S_default": _rec("all", 100.0, 1.0)}, {"00_vanilla_S": ("failed", "x")})
+    md = kr.summary_markdown(rows, {"name": "GPU", "capability": [8, 9], "sms": 142},
+                             SimpleNamespace(run_id="t", gpu="0", dry_run=True, models=["S"], warmup=1, steps=1), {}, 1.0)
+    assert "| speedup vs vanilla | loss | loss vs vanilla |" in md and "n/a" in md and "Loss flags: none." in md
+
+def test_synthetic_inputs_same_with_and_without_uint8():
+    """ bench/harness.py: the vanilla step (no perf_uint8_images) and the flagged steps get the same images, so their
+    losses compare; LitREPA.on_after_batch_transfer normalizes the uint8 ones """
+    import torch
+    import harness
+    from repa import LitREPA
+    from test_perf_equivalence import make_config
+    ref, new = make_config("tiny"), make_config("tiny", "uint8_images")
+    a, b = harness._SyntheticBatches(ref, 1).batch, harness._SyntheticBatches(new, 1).batch
+    assert b["img"].dtype == torch.uint8 and torch.equal(a["position_ids"], b["position_ids"])
+    out = LitREPA(new).on_after_batch_transfer({"img": b["img"].clone()}, 0)["img"]
+    assert torch.equal(out, a["img"])

@@ -64,11 +64,13 @@ class _SyntheticBatches(torch.utils.data.Dataset):
         g = torch.Generator().manual_seed(0)
         B, N = cfg.batch_size, (cfg.image_size // cfg.patch_size) ** 2
         shape = (B, cfg.num_channels, cfg.image_size, cfg.image_size)
-        if cfg.perf_uint8_images:
-            img = torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
-        else:
+        img = torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
+        if not cfg.perf_uint8_images:
+            # ToTensor + Normalize of the same uint8 images, so runs with and without perf_uint8_images get the same
+            # inputs and their losses compare (LitREPA.on_after_batch_transfer applies these ops on the GPU,
+            # bit-identical: tests/test_perf_equivalence.py test_uint8_images_bit_identical)
             mean, std = torch.tensor(IMAGE_MEAN).view(-1, 1, 1), torch.tensor(IMAGE_STD).view(-1, 1, 1)
-            img = (torch.rand(shape, generator=g) - mean) / std
+            img = img.float().div(255).sub_(mean).div_(std)
         self.batch = {
             "img": img,
             "position_ids": torch.stack([torch.randperm(N, generator=g) for _ in range(B)]),
