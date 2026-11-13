@@ -14,7 +14,13 @@ ENV_NAME=repa-kern bash bench/setup_env.sh
 Driver 525 to 579 (CUDA 12 fallback):
 
 ```bash
-conda create -y -n repa-kern-cu126 python=3.14.8 pip && conda env config vars set -n repa-kern-cu126 PYTHONNOUSERSITE=1 && conda run -n repa-kern-cu126 python -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126 && conda run -n repa-kern-cu126 python -m pip install pytorch-lightning==2.6.6 lightning==2.6.6 transformers==5.19.0 timm==1.0.30 numpy==2.5.3 pillow==12.3.0 opencv-python-headless==5.0.0.93 wandb==0.30.0 huggingface-hub==1.33.0 pytest torchao==0.18.0
+conda create -y -n repa-kern-cu126 python=3.14.8 pip
+conda env config vars set -n repa-kern-cu126 PYTHONNOUSERSITE=1
+conda run -n repa-kern-cu126 python -m pip install torch==2.14.1 torchvision==0.29.1 \
+    --index-url https://download.pytorch.org/whl/cu126
+conda run -n repa-kern-cu126 python -m pip install pytorch-lightning==2.6.6 lightning==2.6.6 \
+    transformers==5.19.0 timm==1.0.30 numpy==2.5.3 pillow==12.3.0 opencv-python-headless==5.0.0.93 \
+    wandb==0.30.0 huggingface-hub==1.33.0 pytest torchao==0.18.0
 ```
 
 You don't pick the env yourself: `run_all.sh` starts with a preflight that reads the driver version, picks
@@ -31,6 +37,9 @@ bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa --dry-run
 bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa             # full, ~2-3 h
 ```
 
+To smoke-test every step, including FP8 and max-autotune, before the full run:
+`bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa --models S --warmup 3 --steps 5 --run-id smoke`
+
 - Resume: run the same command again. Finished steps are skipped, failed ones are retried.
 - Results: `bench/results/<run_id>/summary.md` (also `summary.json`, one JSON per step, and logs in `logs/`).
 - Data layout: `<root>/train/<wnid>/*.JPEG`. Without `--data-root` the real-data step is skipped.
@@ -39,11 +48,11 @@ bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa          
 
 | Flag | What it does |
 |---|---|
-| `--gpu N` | Physical GPU to use, as `nvidia-smi` numbers it. Without it, a single-GPU `CUDA_VISIBLE_DEVICES` is used. |
+| `--gpu N` | Physical GPU to use, as `nvidia-smi` numbers it. Without it, set `CUDA_VISIBLE_DEVICES` to one GPU yourself. |
 | `--force` | Run even if the GPU looks busy (timings will be off). |
 | `--data-root DIR` | ImageNet-style folder for the real-data step. Defaults to `$DATA_ROOT`. |
 | `--num-workers N` | Dataloader workers for the real-data step (default 8, or `$NUM_WORKERS`). |
-| `--dry-run` | Short local check: model S only, batch 32, 3 + 5 steps, no FP8 or max-autotune steps. |
+| `--dry-run` | Short check: model S only, batch 32, 3 + 5 steps, no FP8 or max-autotune steps. |
 | `--skip REGEX ...` | Don't run steps whose name matches, e.g. `gqa` or `max-autotune\+cd`. |
 | `--run-id ID` | Name of the results folder. The same ID resumes. Default `kern-<host>-gpu<N>`, plus `-dry`. |
 | `--step-timeout S` | Seconds before a step is killed (default 5400, dry run 1200). |
@@ -65,7 +74,7 @@ applied by the runner and have no config field.
 
 | Flag | What it does | Notes |
 |---|---|---|
-| `perf_skip_last_content` | In the last layer the content stream only computes K/V; the rest never reached the loss. | Config. Same results. |
+| `perf_skip_last_content` | In the last layer the content stream only computes K/V, since the rest of its output never reaches the loss. | Config. Same results. |
 | `perf_causal_no_mask` | Drops the last permuted patch so both streams use causal SDPA without masks, which lets FlashAttention run. | Config. Needed by `kern_attn_fused`. |
 | `perf_query_proj_once` | In layer 1 runs LayerNorm and the Q projection on the one shared query row, then broadcasts. | Config. RoPE models only. |
 | `perf_no_cpu_sync` | Masked-mean loss instead of boolean indexing, and `train/lr` logged once per epoch. | Config. Removes GPU waits. |
