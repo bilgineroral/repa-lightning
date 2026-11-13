@@ -38,7 +38,7 @@ bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa          
 ```
 
 To smoke-test every step, including FP8 and max-autotune, before the full run:
-`bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa --models S --warmup 3 --steps 5 --run-id smoke`
+`bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa --models S --warmup 3 --steps 5 --global-batch 512 --run-id smoke`
 
 - Resume: run the same command again. Finished steps are skipped, failed ones are retried.
 - Results: `bench/results/<run_id>/summary.md` (also `summary.json`, one JSON per step, and logs in `logs/`).
