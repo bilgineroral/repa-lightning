@@ -55,13 +55,12 @@ def stable_grad_buffers(torch):
 
 def apply_fp8_recipe(torch, recipe):
     import repa
-    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-    config = Float8LinearConfig.from_recipe_name(recipe)
+    from torchao.float8 import Float8LinearConfig
+    float8_config = Float8LinearConfig.from_recipe_name(recipe)
+    original = repa.convert_to_fp8
 
-    def convert_to_fp8(model): # repa.convert_to_fp8 with an explicit recipe; same module filter
-        return convert_to_float8_training(
-            model, config=config,
-            module_filter_fn=lambda m, fqn: isinstance(m, torch.nn.Linear) and m.in_features % 16 == 0 and m.out_features % 16 == 0)
+    def convert_to_fp8(model, config=None): # repa.convert_to_fp8 with an explicit recipe; same module filter
+        return original(model, config, float8_config=float8_config)
     repa.convert_to_fp8 = convert_to_fp8 # LitREPA.__init__ calls it by module-global name
 
 def apply_sdpa(torch, backend):

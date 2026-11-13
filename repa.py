@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from transformers import get_cosine_schedule_with_warmup
 import math
 
-from config import PretrainConfig, arch_predict_offset
+from config import PretrainConfig, arch_predict_offset, arch_single_stream
 from dataset import IMAGE_MEAN, IMAGE_STD, seed_training_batch
 from modules import REPA
 from optim import get_decay_parameter_names, hf_accumulation_scale
@@ -37,14 +37,41 @@ def fp8_supported() -> bool:
     """ torchao float8 training needs FP8 tensor cores: compute capability >= 8.9 (Ada, Hopper or newer) """
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 
-def convert_to_fp8(model):
-    """ perf_fp8: swap nn.Linear for torchao's Float8Linear (its default recipe: dynamic tensorwise scaling). FP8 GEMMs
-    need both matrix dims divisible by 16; the patch embedding is a Conv2d and stays bf16. Parameter names and
-    checkpoints are unchanged. """
+def fp8_bf16_modules(config) -> set:
+    """ names (in REPA) of the Linear layers perf_fp8 must leave in bf16, beyond the %16 rule of fp8_module_filter.
+    perf_query_proj_once runs the query stream's Q projection on one row, the shared query token w (modules.py, REPA.forward
+    and REPALayer.forward), in the layer where the query stream starts (layer 0, or L - arch_query_top_k). FP8's
+    grad_weight matmul contracts over the rows (torchao float8_linear.py: mm(grad_output.t(), input)), and
+    torch._scaled_mm needs that dimension divisible by 16: with 1 row it fails at any batch size. An M = 1 matmul gains
+    nothing from FP8 anyway. The same q_proj module also computes that layer's content-stream Q projection, which so
+    runs in bf16 too. """
+    if config is None or not getattr(config, "perf_query_proj_once", False):
+        return set()
+    if not (config.use_query_stream and config.use_rope) or arch_single_stream(config):
+        return set() # no w row: REPA.forward only uses it for the two-stream RoPE model
+    k = getattr(config, "arch_query_top_k", 0)
+    start = config.num_hidden_layers - k if k else 0
+    return {f"encoder.layers.{start}.attention.q_proj"}
+
+def fp8_module_filter(config):
+    """ module_filter_fn for convert_to_float8_training: True = convert to Float8Linear. Skips the layers of
+    fp8_bf16_modules and, as torchao recommends, any Linear whose in or out features aren't divisible by 16 """
+    keep_bf16 = fp8_bf16_modules(config)
+
+    def convert(module, fqn):
+        return (isinstance(module, torch.nn.Linear) and fqn not in keep_bf16
+                and module.in_features % 16 == 0 and module.out_features % 16 == 0)
+    return convert
+
+def convert_to_fp8(model, config=None, float8_config=None):
+    """ perf_fp8: swap nn.Linear for torchao's Float8Linear (default recipe: dynamic tensorwise scaling; float8_config
+    picks another). The patch embedding is a Conv2d and stays bf16; fp8_module_filter says which Linear layers stay
+    bf16, and they are printed once. Parameter names and checkpoints are unchanged. """
     from torchao.float8 import convert_to_float8_training
-    return convert_to_float8_training(
-        model, module_filter_fn=lambda m, fqn: isinstance(m, torch.nn.Linear) and m.in_features % 16 == 0 and m.out_features % 16 == 0
-    )
+    convert = fp8_module_filter(config)
+    bf16 = [n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear) and not convert(m, n)]
+    print(f"perf_fp8: Linear layers left in bf16: {', '.join(bf16) if bf16 else 'none'}", flush=True)
+    return convert_to_float8_training(model, config=float8_config, module_filter_fn=convert)
 
 class LitREPA(pl.LightningModule):
     def __init__(self, config: PretrainConfig):
@@ -55,7 +82,7 @@ class LitREPA(pl.LightningModule):
             if not fp8_supported():
                 cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
                 raise RuntimeError(f"perf_fp8 needs a GPU with compute capability >= 8.9 (Ada / Hopper); found {cap}")
-            model = convert_to_fp8(model)
+            model = convert_to_fp8(model, config)
         if config.compile:
             model = torch.compile(model)
         self.model = model

@@ -94,7 +94,7 @@ def test_fp8_loss_tracks_bf16_ls1():
         opt = torch.optim.AdamW(lit.parameters(), lr=1e-4)
         out = []
         for step in range(20):
-            img, pos, s = make_batch(cfg, 8, "cuda", seed=step)
+            img, pos, s = make_batch(cfg, 16, "cuda", seed=step) # FP8: batch % 16 (config.py perf_fp8 check)
             torch.manual_seed(1000 + step)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 tgt, pred = lit.model(img, position_ids=pos)

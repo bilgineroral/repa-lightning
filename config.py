@@ -221,6 +221,10 @@ class PretrainConfig:
             if self.arch_train_res % self.patch_size:
                 raise ValueError("arch_train_res must be a multiple of patch_size")
             self.image_size = self.arch_train_res
+        if self.perf_fp8 and self.batch_size % 16:
+            # FP8's grad_weight matmul contracts over batch x tokens rows (197 with CLS), which torch._scaled_mm needs
+            # divisible by 16: only a batch that is a multiple of 16 guarantees it
+            raise ValueError(f"perf_fp8 needs per-GPU batch size divisible by 16 (torch._scaled_mm), got {self.batch_size}")
         if self.kern_attn_fused not in ("", "gqa", "flex"):
             raise ValueError(f"kern_attn_fused must be '', 'gqa' or 'flex', got {self.kern_attn_fused!r}")
 
