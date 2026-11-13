@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 3 benchmark sequence on one GPU (bench/KERNEL_PLAN.md section 5): vanilla baseline (no Tier 1 flags),
+# Tier 3 benchmark sequence on one GPU (usage: bench/README.md): vanilla baseline (no Tier 1 flags),
 # preflight, profiles, compile modes, FP8 recipes, best-settings profile + re-rank rule, SDPA backends, real vs synthetic data.
 #   bash bench/run_all.sh --gpu 0 [--data-root $HOME/imagenet]       # full run (Arcturus, RTX 6000 Ada)
 #   bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake  # local check (RTX 3060)

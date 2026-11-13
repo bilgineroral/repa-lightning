@@ -1,230 +1,97 @@
-# REPA pretraining speed benchmarks
+# REPA speed benchmarks
 
-Speed flags for pretraining, plus tests and benchmarks to check them. Every flag is off by default, and with all
-flags off the code behaves exactly as before.
+Benchmarks for REPA pretraining speed on one GPU. `bench/run_all.sh` times a vanilla baseline (no speed flags) and
+then the optional speed flags and settings below, and checks that the loss still matches. Every flag is off by default.
 
-| flag (`--perf` name) | what it does | config field |
-|---|---|---|
-| `skip_last_content` | In the last layer, the content stream computes only K/V. Its attention output and MLP never reached the loss. | `perf_skip_last_content` |
-| `causal_no_mask` | Drops the last permuted patch from the content stream (no query attends to it), so both streams use SDPA `is_causal=True` with no masks. This lets FlashAttention run. | `perf_causal_no_mask` |
-| `query_proj_once` | In layer 1 every query row is `w`, so LayerNorm, the Q projection and QK-norm run on one row and are broadcast. RoPE models only. | `perf_query_proj_once` |
-| `no_cpu_sync` | Masked-mean loss instead of boolean indexing; `train/lr` is logged once per epoch (same epoch mean). Both removed a GPU-to-CPU wait per batch. | `perf_no_cpu_sync` |
-| `uint8_images` | The dataloader returns uint8 images from pinned memory; `x / 255` and `Normalize` run on the GPU (bit-identical inputs). | `perf_uint8_images` |
-| `fused_adamw` | `AdamW(fused=True)`. Lightning refuses to clip gradients for fused optimizers under AMP, so `LitREPA.configure_gradient_clipping` runs the same `clip_grad_norm_` itself. bf16 and fp32 only. | `perf_fused_adamw` |
-| `ddp_static_graph` | `DDPStrategy(static_graph=True)`. Multi-GPU only; does nothing on one GPU. | `perf_ddp_static_graph` |
-| `fp8` (Tier 2, not in `all`) | torchao float8 training for every `nn.Linear` (default dynamic tensorwise recipe). Needs compute capability >= 8.9 (Ada / Hopper) and refuses otherwise. **Not bit-exact**: the test checks the loss stays within 5% of bf16 over 20 steps. Use `--perf all,fp8`. | `perf_fp8` |
+## Setup
 
-Training with flags: `python pretrain.py --model small --data-root <root> --perf all`
-(or a comma list, e.g. `--perf skip_last_content,causal_no_mask`).
-
-Except for `fp8`, the model and loss are unchanged: same parameters, same checkpoints, and old checkpoints still load. The tests
-check equal loss and gradients. Equality is exact up to float rounding only with drop path 0 (the default). With
-drop path, `skip_last_content` changes the order of random draws.
-
-## Kernel flags (same model, Tier 3)
-
-Like the perf flags: the model, its parameters and checkpoints don't change, the flags are off by default, and
-`tests/test_kern_equivalence.py` checks fp32 loss and gradients against the current path (rtol 1e-5). Set them with
-`--kern` in the bench scripts, comma separated `name[=value]`. Config fields are `kern_<name>`.
-
-| `--kern` | what it does | config field |
-|---|---|---|
-| `patch_linear` | Patch embedding as reshape + one GEMM (`F.linear` with the conv weight viewed as `[D, C*p*p]`) instead of the stride-16 Conv2d. Falls back to the conv when the image side isn't a multiple of the patch size. | `kern_patch_linear` |
-| `attn_fused=gqa` | Both streams' attention in one SDPA call over the shared K/V: queries stacked as 2H heads with `enable_gqa=True`. Needs `causal_no_mask`; elsewhere (masks, the last layer with `skip_last_content`, attention dropout in training) the two calls run as before. | `kern_attn_fused` |
-| `attn_fused=flex` | The same with FlexAttention: queries interleaved as 2N rows (content t, query t) and the block mask `q // 2 >= kv`, so every K/V tile serves both streams. Needs `torch.compile` for the Triton kernel (eager mode runs a slow reference). | `kern_attn_fused` |
-
-```bash
-python bench/step_time.py --model S --flags all --kern patch_linear,attn_fused=flex
-```
-
-## Architecture flags (these change the model)
-
-Speed-only benchmarks of the report's alternatives. They **change the model**, so there are no equivalence tests. The
-sanity tests check that each setting builds, runs, gives every parameter a gradient, and lowers the loss over 50 steps
-on a tiny batch (`tests/test_arch_sanity.py`). Accuracy needs pilot runs. Set them with `--arch` in `pretrain.py` or
-the bench scripts, comma separated `name[=value]`. Config fields are `arch_<name>`, all off by default.
-
-| `--arch` | what changes | FLOP estimate |
-|---|---|---:|
-| `single_stream_ref` | no query stream: the content stream alone, square causal over the permuted order (reference for the two-stream cost) | 1.83 |
-| `query_top_k=K` | query stream only in the top K layers; it starts as `w` at layer L-K (K = 6, 4) | 1.36, 1.52 |
-| `single_stream_target_pos` | option B, as in `~/repa-notes/option_b_design.md`: single stream, row j gets the target position `e_tgt[pi_j]` added. Options: `target_pos_type=learned\|sincos`, `target_pos_layers=k` (add before each of the last k layers instead of at the input), `target_pos_null_p=p` (null token on a fraction of rows, excluded from the loss) | 1.83 |
-| `query_mlp_width=W` | separate query-stream MLP of width W (`2d`, `d`, or a number) | 1.26, 1.40 |
-| `train_res=160` | pretrain at 160 px (100 patches). RoPE coordinates are normalized, so no other change. | ~1.6 (schedule) |
-| `predict_frac=F` | predict only the last F of each order; query rows for the other targets aren't computed (F = 0.5, 0.25) | 1.36, 1.61 |
-
-FLOP estimates are the report's ratios to the two-stream baseline, not step-time predictions. `train_res`'s 1.6 is
-for a 75% / 25% 160 to 224 px schedule; one 160 px step is 2.12x (S) in `flop_model.py`.
-
-The single-stream modes set `use_query_stream=False` themselves (in `pretrain.py` and the bench). The two-stream perf
-flags (`skip_last_content`, `causal_no_mask`, `query_proj_once`) do nothing in single-stream mode. Option B always
-uses `is_causal`. Not implemented from the option B design: injecting the null token in fine-tuning
-(`classifier.py` / `segmentation.py`, its step 6).
-
-```bash
-MODELS=S BATCH_S=128 ACCUM_S=32 bash bench/run_arch.sh
-```
-
-This runs each setting alone and with all Tier 1 perf flags, plus both baselines, on synthetic data with the
-optimizer on. `run_tier12.sh` runs it after the Tier 1 matrix; results go to `bench/results/<timestamp>/arch/` and
-`summary_arch.md`.
-
-## On Arcturus, from a fresh login
-
-Run these from the repo root, in order.
-
-**1. Get the code**
-
-```bash
-cd ~/repa-lightning && git fetch origin && git checkout repa-speedup && git pull
-```
-
-**2. Environment (once).** The Tier 3 runner (`run_all.sh`) uses the conda env `repa-kern`. If it already exists,
-this only reports its versions and changes nothing; if it's missing packages, the script prints what to do.
+Driver 580 or newer (CUDA 13):
 
 ```bash
 ENV_NAME=repa-kern bash bench/setup_env.sh
 ```
 
-If the driver is 525-579 (CUDA 12 only; check with `nvidia-smi`), build the `repa-kern-cu126` fallback instead, as in
-`bench/ENV.md`. `run_all.sh`'s preflight reads the driver version and picks `repa-kern` (>= 580) or `repa-kern-cu126`
-(525-579) automatically.
-
-**3. Preflight.** Reports GPUs (name, count, capability, memory, other processes), torch and CUDA versions, which
-attention kernel actually runs for our shapes, whether FP8 is possible, `sbatch`, CPUs and free disk. It also checks
-that `DATA_ROOT` has the layout `dataset.py` expects (`<root>/train/<wnid>/*.JPEG` and `<root>/val/<wnid>/*.JPEG`)
-and fails with what it found if not. Read the output before launching.
+Driver 525 to 579 (CUDA 12 fallback):
 
 ```bash
-DATA_ROOT=$HOME/imagenet bash bench/preflight.sh
+conda create -y -n repa-kern-cu126 python=3.14.8 pip && conda env config vars set -n repa-kern-cu126 PYTHONNOUSERSITE=1 && conda run -n repa-kern-cu126 python -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126 && conda run -n repa-kern-cu126 python -m pip install pytorch-lightning==2.6.6 lightning==2.6.6 transformers==5.19.0 timm==1.0.30 numpy==2.5.3 pillow==12.3.0 opencv-python-headless==5.0.0.93 wandb==0.30.0 huggingface-hub==1.33.0 pytest torchao==0.18.0
 ```
 
-**4. Launch.** Submits `bench/run_all.sh` to Slurm if `sbatch` exists. Otherwise it starts a tmux session (or
-nohup) on `GPU=0` and refuses if that GPU is busy. Choose another with `GPU=<id>`. GPU count, time limit and
-partition are variables at the top of `bench/launch.sh`. The script prints how to check progress.
+You don't pick the env yourself: `run_all.sh` starts with a preflight that reads the driver version, picks
+`repa-kern` or `repa-kern-cu126`, and stops with a message if the env is missing, the driver is too old, or the GPU is
+busy. It warns if the GPU isn't compute capability 8.9 (RTX 6000 Ada). `ENV_NAME=<env>` overrides the choice.
+
+## Run it
 
 ```bash
-DATA_ROOT=$HOME/imagenet bash bench/launch.sh
-```
-
-`launch.sh` starts `run_all.sh`, the Tier 3 runner (next section). The Tier 1/2 run that used to be `run_all.sh` is
-now `bench/run_tier12.sh`; start it by hand (`DATA_ROOT=$HOME/imagenet bash bench/run_tier12.sh`). It runs, in order:
-1. preflight
-2. the full pytest suite
-3. a batch-size probe for S and B: the config batch (256 / 128), halved until it fits, checked with all flags too.
-   Gradient accumulation is set to keep the config's global batch of 4096.
-4. the Tier 1 matrix: baseline, each flag and all flags, for synthetic and real data
-5. profiles of baseline vs all flags
-6. FP8 runs (`--perf fp8` and `all,fp8`), only if preflight found compute capability >= 8.9; otherwise skipped with
-   a message
-7. the architecture-flag runs (`bench/run_arch.sh`)
-
-Everything goes to `bench/results/<timestamp>/` (also `bench/results/latest/`), with a log (`run_tier12.log`), the
-preflight JSON, the chosen batch sizes (`batch_sizes.txt`), one JSON per run, profiles and Chrome traces. A failed
-step doesn't stop the rest; failures are listed at the end of the log.
-
-**5. Summary**
-
-```bash
-cat bench/results/latest/summary.md
+bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa --dry-run   # ~10 min check
 ```
 
 ```bash
-cat bench/results/latest/summary_arch.md
+bash bench/run_all.sh --gpu 0 --data-root /path/to/imagenet --skip gqa             # full, ~2-3 h
 ```
 
-To regenerate it: `python bench/summarize.py --results bench/results/latest/tier1`.
+- Resume: run the same command again. Finished steps are skipped, failed ones are retried.
+- Results: `bench/results/<run_id>/summary.md` (also `summary.json`, one JSON per step, and logs in `logs/`).
+- Data layout: `<root>/train/<wnid>/*.JPEG`. Without `--data-root` the real-data step is skipped.
 
-### Do not
+## Runner flags
 
-- Never write inside the dataset directories. Nothing in `bench/` writes there: preflight only lists and opens
-  files. Don't run `make_fake_imagefolder.py` with a real dataset path.
-- Check `nvidia-smi` before launching. Without Slurm, `launch.sh` refuses a busy GPU unless `FORCE=1`, but other
-  users' jobs can still start later and slow the timings.
-- Don't modify a shared or someone else's `repa` env. Use `ENV_NAME=repa-bench`.
-- Don't commit results. `bench/results/` is git-ignored.
+| Flag | What it does |
+|---|---|
+| `--gpu N` | Physical GPU to use, as `nvidia-smi` numbers it. Without it, a single-GPU `CUDA_VISIBLE_DEVICES` is used. |
+| `--force` | Run even if the GPU looks busy (timings will be off). |
+| `--data-root DIR` | ImageNet-style folder for the real-data step. Defaults to `$DATA_ROOT`. |
+| `--num-workers N` | Dataloader workers for the real-data step (default 8, or `$NUM_WORKERS`). |
+| `--dry-run` | Short local check: model S only, batch 32, 3 + 5 steps, no FP8 or max-autotune steps. |
+| `--skip REGEX ...` | Don't run steps whose name matches, e.g. `gqa` or `max-autotune\+cd`. |
+| `--run-id ID` | Name of the results folder. The same ID resumes. Default `kern-<host>-gpu<N>`, plus `-dry`. |
+| `--step-timeout S` | Seconds before a step is killed (default 5400, dry run 1200). |
+| `--models S B` | Which models to run (default both, dry run S). |
+| `--batch-s N`, `--batch-b N` | Per-GPU batch for S and B (default 256 and 128, dry run 32 and 16). |
+| `--global-batch N` | Sets gradient accumulation to N / batch (default 4096, dry run 2 x batch). |
+| `--warmup N`, `--steps N` | Untimed and timed steps per run (default 20 and 100). |
+| `--profile-steps N` | Steps captured in each profile (default 10). |
+| `--results DIR` | Parent folder for results (default `bench/results`). |
+| `--gpu-visible ID` | `CUDA_VISIBLE_DEVICES` for the steps, if it differs from `--gpu` (default: same). |
 
-## Tier 3 runner (`run_all.sh`)
+`--python` and `--preflight-json` are set by `run_all.sh`; don't pass them.
 
-The benchmark sequence of `bench/KERNEL_PLAN.md` section 5, on one GPU:
+## Speed flags
+
+Config flags live in `config.py`. `pretrain.py` takes the `perf_*` ones as `--perf name,name` (`all` turns on the
+seven Tier 1 flags). The `kern_*` ones are only on the bench scripts' `--kern` for now. Bench-only settings are
+applied by the runner and have no config field.
+
+| Flag | What it does | Notes |
+|---|---|---|
+| `perf_skip_last_content` | In the last layer the content stream only computes K/V; the rest never reached the loss. | Config. Same results. |
+| `perf_causal_no_mask` | Drops the last permuted patch so both streams use causal SDPA without masks, which lets FlashAttention run. | Config. Needed by `kern_attn_fused`. |
+| `perf_query_proj_once` | In layer 1 runs LayerNorm and the Q projection on the one shared query row, then broadcasts. | Config. RoPE models only. |
+| `perf_no_cpu_sync` | Masked-mean loss instead of boolean indexing, and `train/lr` logged once per epoch. | Config. Removes GPU waits. |
+| `perf_uint8_images` | Dataloader returns uint8 images; scaling and Normalize run on the GPU. | Config. Bit-identical inputs. |
+| `perf_fused_adamw` | `AdamW(fused=True)`. | Config. bf16 and fp32 only. |
+| `perf_ddp_static_graph` | DDP with `static_graph=True`. | Config. Multi-GPU only. |
+| `perf_fp8` | torchao float8 training for the Linear layers. | Config, `--perf fp8`, not in `all`. Needs compute capability 8.9 or newer (Ada/Hopper). Not bit-exact. |
+| FP8 recipe | `tensorwise` (default), `rowwise` or `rowwise_with_gw_hp` for `perf_fp8`. | Bench-only. |
+| `kern_patch_linear` | Patch embedding as a reshape plus one matmul instead of the Conv2d, same weights. | Config. 0-2% faster in testing. |
+| `kern_attn_fused=flex` | Both streams' attention in one FlexAttention call over the shared K/V. | Config. Needs `perf_causal_no_mask` and `torch.compile`. 0-2% slower in testing. |
+| `kern_attn_fused=gqa` | Same, as one SDPA call with stacked query heads. | Config. 1-3% slower in testing, skipped with `--skip gqa`. |
+| Compile mode | `torch.compile` mode: default, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`, with or without coordinate descent tuning. | Bench-only. max-autotune needs 68+ SMs. |
+| SDPA backend | Forces cuDNN or memory-efficient attention instead of the default (FlashAttention). | Bench-only. |
+
+## Reading the summary
+
+- `ms/step`: median time per training step (GPU time per step for profile rows).
+- `img/s`: images per second over the timed steps.
+- `peak GiB`: peak GPU memory. It undercounts CUDA-graph modes (`reduce-overhead`, `max-autotune`), which the note says.
+- `speedup_vs_vanilla`: vanilla's ms/step divided by this row's. (`speedup` is the same against `02_compile_<model>_default`, all Tier 1 flags.)
+- `loss_vs_vanilla`: relative difference of the final loss against the vanilla step, same batch, steps and seed. Marked FLAG above 1% (5% for FP8). It checks that the numbers match, not training over time: the learning rate is close to zero in these short runs.
+
+## Tests
 
 ```bash
-bash bench/run_all.sh --gpu 0 --data-root $HOME/imagenet
+conda run -n repa-kern python -m pytest tests/
 ```
 
-```bash
-bash bench/run_all.sh --gpu 0 --dry-run --data-root ~/repa_fake --num-workers 4
-```
-
-1. `bench/kern_preflight.py` (no conda env needed) reads the GPU through `nvidia-smi`.
-   - Compute capability 8.9 (RTX 6000 Ada) is expected; anything else is a warning.
-   - The driver version picks the conda env: >= 580 uses `repa-kern` (CUDA 13), 525-579 uses `repa-kern-cu126`. See `bench/ENV.md`. `ENV_NAME=...` overrides the choice.
-   - It refuses a busy GPU (other processes, memory in use > 2 GiB, or utilization > 20%) unless `--force`.
-2. `bench/kern_runner.py` runs the steps with that env's python and `CUDA_VISIBLE_DEVICES=<gpu>`:
-   - `00` torch preflight
-   - `01` profile, default compile
-   - `02` compile modes: default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs, and coordinate descent
-   - `03` FP8 recipes, with default compile and with the best mode
-   - `04` profile with the best settings, plus the re-rank rule
-   - `05` SDPA cudnn / efficient, plus `kern_patch_linear` / `kern_attn_fused` once `config.py` has them
-   - `06` real vs synthetic data
-
-   Compile mode, FP8 recipe and SDPA backend are applied by `bench/kern_step.py` without changing the model code; the
-   `kern_*` steps pass `--kern`.
-
-   Inductor caches are shared per family: default and reduce-overhead together, max-autotune and max-autotune-no-cudagraphs together, and each +cd variant separately. So max-autotune benchmarks each GEMM shape once per run, not once per step. Steps with a non-default SDPA backend keep the family's GEMM autotune results but turn off the FX graph and AOTAutograd caches, because those cache keys ignore the SDPA toggles.
-3. Results go to `bench/results/<run_id>/<step>.json`, together with nvidia-smi and system-load snapshots from before and after the step. A rerun with the same `--run-id` skips finished steps; the default id is fixed per host, GPU and dry/full. Failed steps write `<step>.failed.json` and are retried next time.
-4. Each step has a timeout: `--step-timeout`, default 5400 s (dry run 1200 s).
-5. At the end, `summary.md` / `summary.json` and `rerank.json` are written to the run directory.
-
-`--dry-run` is for the local 3060: S only, batch 32, 3 + 5 steps. It always skips the sm_89-only steps (FP8, max-autotune GEMM templates). Full-run steps that the hardware can't do (capability < 8.9, fewer than 68 SMs, no `--data-root`) are listed as "not run" and no JSON is written for them.
-
-## Running parts by hand
-
-```bash
-python -m pytest tests/ -v
-```
-
-```bash
-CUDA_VISIBLE_DEVICES=0 DATA_ROOT=$HOME/imagenet BATCH_S=256 ACCUM_S=16 MODELS=S bash bench/run_tier1.sh
-```
-
-```bash
-python bench/step_time.py --model S --flags all --data real --data-root $HOME/imagenet --optimizer --accum 16
-```
-
-```bash
-python bench/profile_step.py --model S --flags all
-```
-
-`run_tier1.sh` variables: `MODELS`, `DATAS`, `DATA_ROOT`, `BATCH_S`/`BATCH_B`, `ACCUM` (or `ACCUM_S`/`ACCUM_B`),
-`WARMUP` (20, covers `torch.compile`), `STEPS` (100), `NUM_WORKERS` (8), `OUT`. Synthetic runs have no data decode
-and no optimizer step, to isolate the model step. Real-data runs use the real dataloader and include the optimizer
-step every `ACCUM` micro-batches.
-
-## What the numbers mean
-
-- `ms/step`: time between the starts of consecutive training batches, measured with CUDA events. Includes waiting for
-  data, the host-to-device copy, forward, backward and (if enabled) the optimizer step.
-- `compute ms`: start to end of one training batch. Excludes the wait for the next batch.
-- `img/s`: wall-clock throughput over the timed steps.
-- `speedup`: baseline ms/step divided by this row's ms/step, within the same table.
-- Profile buckets: GPU kernel time per step in matmul / attention / layernorm / other_elementwise (plus optimizer and
-  memcpy). Annotations are excluded.
-
-## Running locally (no ImageNet)
-
-```bash
-python bench/make_fake_imagefolder.py --root ~/repa_fake --train 8000 --val 200
-```
-
-```bash
-MODELS=S STEPS=10 WARMUP=5 DATA_ROOT=~/repa_fake bash bench/launch.sh
-```
-
-The fake JPEGs have realistic sizes, so decode cost is similar, but the content is random noise.
-
-## Tier 3
-
-Custom-kernel plans: `bench/TIER3.md` and `bench/KERNEL_PLAN.md`. Implemented so far: the kernel flags
-above (`kern_patch_linear`, `kern_attn_fused`).
+CPU tests always run. GPU tests run when a GPU is visible; the FP8 ones also need compute capability 8.9.

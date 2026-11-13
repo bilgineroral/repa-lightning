@@ -1,5 +1,5 @@
 """
-Tier 3 benchmark sequence (bench/KERNEL_PLAN.md section 5) on one GPU. Started by bench/run_all.sh, which
+Tier 3 benchmark sequence on one GPU (usage: bench/README.md). Started by bench/run_all.sh, which
 runs bench/kern_preflight.py first (GPU, driver -> conda env, idle check) and then this script with the env's python.
 
 Steps, in the doc's order (S and B unless --models):

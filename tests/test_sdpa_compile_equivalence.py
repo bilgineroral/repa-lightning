@@ -1,5 +1,5 @@
 """
-Equivalence tests the RTX 3060 can run for two Tier 3 runner settings (bench/KERNEL_PLAN.md ranks 1 and 5):
+Equivalence tests the RTX 3060 can run for two Tier 3 runner settings (compile mode and SDPA backend, bench/README.md):
 
 SDPA backends (bench/kern_step.py --sdpa cudnn / efficient): forward and backward of our attention calls (REPA-S
 heads, N = 196 causal, and the 197 x 197 masked call of the original path) against the math backend.
