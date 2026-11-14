@@ -65,6 +65,31 @@ class Step:
 
 LOSS_TOL_FP8, LOSS_TOL = 0.05, 0.01 # |loss_vs_vanilla| above these is flagged in the summary
 
+def known_issue(settings):
+    """ text for a failed step with a known cause, or None """
+    if settings.get("fp8_recipe") == "tensorwise" and settings.get("mode") in TEMPLATE_MODES:
+        return ("known issue: FP8 tensorwise under max-autotune goes NaN on the RTX 6000 Ada. Likely Inductor's Triton "
+                "scaled_mm templates for the e5m2 x e4m3 backward GEMMs: the rowwise recipes (e4m3 only) stay finite "
+                "under max-autotune, and default compile (cuBLAS _scaled_mm) stays finite")
+    return None
+
+def classify(step, settings, result):
+    """ (status, error) of a step whose process exited 0. A timed step whose loss isn't finite has failed: it is never
+    'ok', is written as <step>.failed.json and is retried on the next run """
+    if result is None:
+        return "failed", "exit 0 but no result JSON"
+    if step.kind == "time" and result.get("loss_all_finite") is False:
+        issue = known_issue(settings)
+        return "failed", "non-finite loss" + (f"; {issue}" if issue else "")
+    return "ok", None
+
+def finite_ok(rec):
+    """ a recorded step that counts as done: status ok and, for a timed step, a finite loss (results written before
+    the non-finite rule may say ok with a NaN loss) """
+    if not rec or rec.get("status") != "ok":
+        return False
+    return not (rec.get("kind") == "time" and (rec.get("result") or {}).get("loss_all_finite") is False)
+
 def build_plan(models, dry_run):
     # vanilla first: the reference every other step's loss and speed is compared with
     plan = [Step(f"00_vanilla_{m}", "time", m, flags="none") for m in models]
@@ -139,7 +164,7 @@ def ms(rec):
 def best_mode(results, model):
     """ fastest 02 step for the model -> (mode, coord_descent, step id); default if none finished """
     cands = [(ms(r), r["settings"]["mode"], r["settings"]["coord_descent"], k) for k, r in results.items()
-             if k.startswith(f"02_compile_{model}_") and r.get("status") == "ok" and ms(r)]
+             if k.startswith(f"02_compile_{model}_") and finite_ok(r) and ms(r)]
     if not cands:
         return "default", False, None
     _, mode, cd, k = min(cands)
@@ -151,7 +176,7 @@ def best_overall(results, model):
     best = {"mode": mode, "coord_descent": cd, "fp8_recipe": "", "from": k,
             "ms": ms(results[k]) if k else None}
     for name, r in results.items():
-        if name.startswith(f"03_fp8_{model}_") and r.get("status") == "ok" and ms(r) and (best["ms"] is None or ms(r) < best["ms"]):
+        if name.startswith(f"03_fp8_{model}_") and finite_ok(r) and ms(r) and (best["ms"] is None or ms(r) < best["ms"]):
             s = r["settings"]
             best = {"mode": s["mode"], "coord_descent": s["coord_descent"], "fp8_recipe": s["fp8_recipe"], "from": name,
                     "ms": ms(r)}
@@ -270,10 +295,7 @@ class Runner:
         result, meta = None, None
         if rc == 0:
             result = self.find_result(step, raw)
-            if result is None:
-                err = "exit 0 but no result JSON"
-            else:
-                status = "ok"
+            status, err = classify(step, s, result)
         elif err is None:
             err = f"exit code {rc}"
         if os.path.exists(os.path.join(raw, "meta.json")):
@@ -349,9 +371,14 @@ def run_plan(plan, run_dir, execute, can_run, resolve_fn, log):
     for step in plan:
         done = os.path.join(run_dir, f"{step.id}.json")
         if os.path.exists(done):
-            log(f"[skip] {step.id}: done ({os.path.basename(done)} exists)")
-            states[step.id] = ("done", "")
-            continue
+            with open(done) as f:
+                earlier = json.load(f)
+            if finite_ok(earlier):
+                log(f"[skip] {step.id}: done ({os.path.basename(done)} exists)")
+                states[step.id] = ("done", "")
+                continue
+            log(f"[redo] {step.id}: recorded as ok earlier, but its loss is not finite")
+            os.remove(done)
         reason = can_run(step)
         if reason is None and "best_differs" in step.requires:
             s = resolve_fn(step, load_results(run_dir))

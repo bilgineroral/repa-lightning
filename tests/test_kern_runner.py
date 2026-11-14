@@ -202,3 +202,31 @@ def test_synthetic_inputs_same_with_and_without_uint8():
     assert b["img"].dtype == torch.uint8 and torch.equal(a["position_ids"], b["position_ids"])
     out = LitREPA(new).on_after_batch_transfer({"img": b["img"].clone()}, 0)["img"]
     assert torch.equal(out, a["img"])
+
+def test_non_finite_loss_fails_the_step():
+    step = kr.Step("02_compile_S_default", "time", "S")
+    assert kr.classify(step, {"mode": "default"}, {"loss_all_finite": True}) == ("ok", None)
+    status, err = kr.classify(step, {"mode": "default"}, {"loss_all_finite": False})
+    assert status == "failed" and err == "non-finite loss"
+    fp8 = kr.Step("03_fp8_S_tensorwise_bestmode", "time", "S")
+    status, err = kr.classify(fp8, {"mode": "max-autotune", "fp8_recipe": "tensorwise"}, {"loss_all_finite": False})
+    assert status == "failed" and "known issue: FP8 tensorwise under max-autotune" in err
+    prof = kr.Step("04_profile_S_best", "profile", "S") # profiles record no loss
+    assert kr.classify(prof, {"mode": "default"}, {}) == ("ok", None)
+    assert kr.classify(step, {"mode": "default"}, None)[0] == "failed"
+
+def test_resume_reruns_ok_step_with_non_finite_loss(tmp_path):
+    """ results written before the rule: status ok but a NaN loss (smoke run, 03_fp8_S_tensorwise_bestmode). Resume
+    must redo it, not skip it, and it must never count as the best mode """
+    step = kr.Step("03_fp8_S_tensorwise_bestmode", "time", "S", flags="all,fp8", fp8_recipe="tensorwise")
+    nan_rec = {**_record(step, 90.0), "kind": "time", "result": {"ms_per_step_median": 90.0, "loss_all_finite": False}}
+    kr.write_json(str(tmp_path / f"{step.id}.json"), nan_rec)
+    assert not kr.finite_ok(nan_rec)
+    ran = []
+    resolve = lambda st, results: {"mode": "max-autotune", "coord_descent": False, "fp8_recipe": "tensorwise", "flags": "all,fp8"}
+    states = kr.run_plan([step], str(tmp_path), lambda st, x: (ran.append(st.id), _record(st))[1], lambda st: None,
+                         resolve, lambda m: None)
+    assert ran == [step.id] and states[step.id][0] == "ok"
+    fast_nan = {**nan_rec, "step": "02_compile_S_max-autotune", "settings": {"mode": "max-autotune", "coord_descent": False}}
+    ok = {**_rec("all", 100.0, 1.0), "kind": "time", "settings": {"mode": "default", "coord_descent": False}}
+    assert kr.best_mode({"02_compile_S_max-autotune": fast_nan, "02_compile_S_default": ok}, "S")[0] == "default"
