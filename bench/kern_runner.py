@@ -500,9 +500,10 @@ def rerank(run_dir, models):
 # ---------------------------------------------------------------- summary
 
 def vs_vanilla(step, rec, results):
-    """ (final loss, loss_vs_vanilla, speedup_vs_vanilla, flagged) of a time step vs 00_vanilla_<model>; None where it
-    doesn't apply or the vanilla step is missing or failed. Flagged: |loss_vs_vanilla| above LOSS_TOL_FP8 for FP8
-    steps, LOSS_TOL otherwise """
+    """ (final loss, loss_vs_vanilla, speedup_vs_vanilla, flagged, why loss_vs_vanilla is n/a) of a time step vs
+    00_vanilla_<model>; None where it doesn't apply or the vanilla step is missing or failed. Flagged: |loss_vs_vanilla|
+    above LOSS_TOL_FP8 for FP8 steps, LOSS_TOL otherwise. Real-data steps aren't compared: vanilla trains on synthetic
+    images, so their losses differ for that reason alone """
     r = (rec or {}).get("result") or {}
     loss = r.get("loss_last") if step.kind == "time" else None
     van = results.get(f"00_vanilla_{step.model}")
@@ -510,14 +511,16 @@ def vs_vanilla(step, rec, results):
     v_loss, v_ms = vr.get("loss_last"), vr.get("ms_per_step_median")
     rel = (loss - v_loss) / abs(v_loss) if (loss is not None and v_loss) else None
     speed = v_ms / r["ms_per_step_median"] if (step.kind == "time" and v_ms and r.get("ms_per_step_median")) else None
+    if step.data == "real":
+        return loss, None, speed, False, "real data"
     fp8 = "fp8" in str(((rec or {}).get("settings") or {}).get("flags", "")).split(",")
     flagged = rel is not None and abs(rel) > (LOSS_TOL_FP8 if fp8 else LOSS_TOL)
-    return loss, rel, speed, flagged
+    return loss, rel, speed, flagged, ""
 
 def summary_rows(plan, results, states):
     """ one row per step: [id, status, model, settings, ms/step, img/s, peak GiB, speedup (vs 02 default, or for a step
     run without CUDA graphs vs the matching no-CUDA-graph 02 step), run s, note, loss, loss_vs_vanilla,
-    speedup_vs_vanilla, loss_flagged] """
+    speedup_vs_vanilla, loss_flagged, loss_vs_vanilla_note] """
     rows = []
     for step in plan:
         rec = results.get(step.id)
@@ -555,7 +558,7 @@ def summary_rows(plan, results, states):
                          *vs_vanilla(step, rec, results)])
         else:
             rows.append([step.id, state or "not run", step.model, "", None, None, None, None, None, detail,
-                         None, None, None, False])
+                         None, None, None, False, ""])
     return rows
 
 def fmt(v, nd=1):
@@ -572,13 +575,14 @@ def summary_markdown(rows, hw, args, rr, elapsed):
              "Speedup: vs `02_compile_<model>_default` (all Tier 1 flags, default compile). "
              "loss: final step's loss. vs vanilla: against `00_vanilla_<model>` (no Tier 1 flags, default compile; "
              f"same batch, steps and seed); a loss difference above {LOSS_TOL:.0%} ({LOSS_TOL_FP8:.0%} for FP8) is "
-             "marked FLAG. n/a: not a timed step, or no successful vanilla step. Rows run without CUDA graphs (see note) "
-             "compare speedup with the matching no-CUDA-graph 02 step.", "",
+             "marked FLAG. n/a: not a timed step, or no successful vanilla step; real-data rows aren't compared "
+             "(vanilla uses synthetic data). Rows run without CUDA graphs (see note) compare speedup with the matching "
+             "no-CUDA-graph 02 step.", "",
              "| step | status | model | settings | ms/step | img/s | peak GiB | speedup | speedup vs vanilla | loss "
              "| loss vs vanilla | run s | note |",
              "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for r in rows:
-        rel = "n/a" if r[11] is None else f"{r[11]:+.2%}" + (" FLAG" if r[13] else "")
+        rel = (f"n/a ({r[14]})" if r[14] else "n/a") if r[11] is None else f"{r[11]:+.2%}" + (" FLAG" if r[13] else "")
         svv = "n/a" if r[12] is None else f"{r[12]:.3f}x"
         loss = "n/a" if r[10] is None else f"{r[10]:.4f}"
         lines.append("| " + " | ".join([r[0], r[1], r[2], r[3], fmt(r[4]), fmt(r[5], 0), fmt(r[6], 2),
@@ -699,7 +703,7 @@ def main(argv=None):
     with open(os.path.join(run_dir, "summary.md"), "w") as f:
         f.write(md)
     columns = ["step", "status", "model", "settings", "ms_per_step", "imgs_per_sec", "peak_gib", "speedup",
-               "run_s", "note", "loss", "loss_vs_vanilla", "speedup_vs_vanilla", "loss_flagged"]
+               "run_s", "note", "loss", "loss_vs_vanilla", "speedup_vs_vanilla", "loss_flagged", "loss_vs_vanilla_note"]
     write_json(os.path.join(run_dir, "summary.json"), {"columns": columns, "rows": [dict(zip(columns, r)) for r in rows],
                                                        "rerank": rr, "hardware": hw,
                                                        "best": {m: best_overall(results, m) for m in args.models}})

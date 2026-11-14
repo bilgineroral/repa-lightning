@@ -172,16 +172,16 @@ def _rec(flags, ms_, loss, status="ok"):
 def test_loss_and_speed_vs_vanilla():
     step = kr.Step("05_x_S", "time", "S")
     res = {"00_vanilla_S": _rec("none", 120.0, 1.0)}
-    loss, rel, speed, flag = kr.vs_vanilla(step, _rec("all", 100.0, 1.005), res)
-    assert loss == 1.005 and abs(rel - 0.005) < 1e-12 and abs(speed - 1.2) < 1e-12 and not flag
+    loss, rel, speed, flag, why = kr.vs_vanilla(step, _rec("all", 100.0, 1.005), res)
+    assert loss == 1.005 and abs(rel - 0.005) < 1e-12 and abs(speed - 1.2) < 1e-12 and not flag and why == ""
     assert kr.vs_vanilla(step, _rec("all", 100.0, 1.02), res)[3] # 2% > 1% for non-FP8
     assert not kr.vs_vanilla(step, _rec("all,fp8", 100.0, 1.02), res)[3] # within FP8's 5%
     assert kr.vs_vanilla(step, _rec("all,fp8", 100.0, 1.06), res)[3]
     # vanilla missing or failed: n/a, no crash
     for r in ({}, {"00_vanilla_S": _rec("none", 120.0, 1.0, status="failed")}):
-        assert kr.vs_vanilla(step, _rec("all", 100.0, 1.0), r) == (1.0, None, None, False)
+        assert kr.vs_vanilla(step, _rec("all", 100.0, 1.0), r) == (1.0, None, None, False, "")
     prof = kr.Step("04_profile_S_best", "profile", "S") # profile steps have no loss / step time to compare
-    assert kr.vs_vanilla(prof, {"status": "ok", "result": {}}, res) == (None, None, None, False)
+    assert kr.vs_vanilla(prof, {"status": "ok", "result": {}}, res) == (None, None, None, False, "")
 
 def test_summary_markdown_columns_without_vanilla():
     plan = [kr.Step("00_vanilla_S", "time", "S", flags="none"), kr.Step("02_compile_S_default", "time", "S")]
@@ -202,6 +202,17 @@ def test_synthetic_inputs_same_with_and_without_uint8():
     assert b["img"].dtype == torch.uint8 and torch.equal(a["position_ids"], b["position_ids"])
     out = LitREPA(new).on_after_batch_transfer({"img": b["img"].clone()}, 0)["img"]
     assert torch.equal(out, a["img"])
+
+def test_real_data_loss_not_compared_with_vanilla():
+    """ vanilla trains on synthetic images: a real-data row's loss differs for that reason alone (smoke run: -1.19%) """
+    res = {"00_vanilla_S": _rec("none", 120.0, 1.0102)}
+    real = kr.Step("06_data_S_real", "time", "S", data="real")
+    loss, rel, speed, flag, why = kr.vs_vanilla(real, _rec("all", 100.0, 0.9981), res)
+    assert loss == 0.9981 and rel is None and not flag and why == "real data" and speed is not None
+    rows = kr.summary_rows([real], {"06_data_S_real": {**_rec("all", 100.0, 0.9981), "kind": "time"}}, {})
+    md = kr.summary_markdown(rows, {"name": "GPU", "capability": [8, 9], "sms": 142},
+                             SimpleNamespace(run_id="t", gpu="0", dry_run=False, models=["S"], warmup=1, steps=1), {}, 1.0)
+    assert "n/a (real data)" in md and "Loss flags: none." in md
 
 def test_non_finite_loss_fails_the_step():
     step = kr.Step("02_compile_S_default", "time", "S")
