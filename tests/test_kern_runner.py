@@ -230,3 +230,25 @@ def test_resume_reruns_ok_step_with_non_finite_loss(tmp_path):
     fast_nan = {**nan_rec, "step": "02_compile_S_max-autotune", "settings": {"mode": "max-autotune", "coord_descent": False}}
     ok = {**_rec("all", 100.0, 1.0), "kind": "time", "settings": {"mode": "default", "coord_descent": False}}
     assert kr.best_mode({"02_compile_S_max-autotune": fast_nan, "02_compile_S_default": ok}, "S")[0] == "default"
+
+def test_attention_steps_run_without_cuda_graphs():
+    """ SDPA cudnn / efficient and attn_fused=flex failed CUDA graph capture under max-autotune on the RTX 6000 Ada:
+    they run the no-CUDA-graph twin of the best mode and compare speed with the matching 02 step """
+    plan = {s.id: s for s in kr.build_plan(["S"], dry_run=False)}
+    assert all(plan[i].no_cudagraphs for i in ("05_sdpa_S_cudnn", "05_sdpa_S_efficient", "05_attn_fused_flex_S"))
+    assert not any(plan[i].no_cudagraphs for i in ("05_patch_linear_S", "05_attn_fused_gqa_S", "06_data_S_synthetic"))
+    results = {"02_compile_S_max-autotune": {**_rec("all", 199.2, 1.0), "kind": "time",
+                                             "settings": {"mode": "max-autotune", "coord_descent": False}},
+               "02_compile_S_max-autotune-no-cudagraphs": {**_rec("all", 202.5, 1.0), "kind": "time",
+                                                           "settings": {"mode": "max-autotune-no-cudagraphs",
+                                                                        "coord_descent": False}}}
+    s = kr.resolve(plan["05_attn_fused_flex_S"], results)
+    assert s["mode"] == "max-autotune-no-cudagraphs" and s["cudagraphs_off_from"] == "max-autotune"
+    assert kr.resolve(plan["05_patch_linear_S"], results)["mode"] == "max-autotune" # unchanged
+    rec = {"status": "ok", "kind": "time", "settings": s, "result": {"ms_per_step_median": 200.0, "loss_last": 1.0}}
+    row = kr.summary_rows([plan["05_attn_fused_flex_S"]], {**results, "05_attn_fused_flex_S": rec}, {})[0]
+    assert abs(row[7] - 202.5 / 200.0) < 1e-12 # vs 02_compile_S_max-autotune-no-cudagraphs, not 02 default
+    assert "CUDA graphs off" in row[9] and "02_compile_S_max-autotune-no-cudagraphs" in row[9]
+    s = kr.resolve(plan["05_sdpa_S_cudnn"], {"02_compile_S_reduce-overhead": {**results["02_compile_S_max-autotune"],
+                                              "settings": {"mode": "reduce-overhead", "coord_descent": False}}})
+    assert s["mode"] == "default" and s["cudagraphs_off_from"] == "reduce-overhead"

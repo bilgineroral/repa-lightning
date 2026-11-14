@@ -62,8 +62,15 @@ class Step:
     kern: str = "" # --kern flags (config.py KERN_FLAGS)
     requires: list = field(default_factory=list) # "fp8", "templates", "data_root", "config:<field>"
     note: str = ""
+    no_cudagraphs: bool = False # run the no-CUDA-graph twin of the resolved mode (see NO_CUDAGRAPH_TWIN)
 
 LOSS_TOL_FP8, LOSS_TOL = 0.05, 0.01 # |loss_vs_vanilla| above these is flagged in the summary
+# Steps whose attention path broke CUDA graph capture under max-autotune on the RTX 6000 Ada (smoke run: cudaErrorStream
+# CaptureInvalidated while recording the forward graph, for SDPA cudnn / efficient and attn_fused=flex; not reproducible
+# on the 3060, where all three pass under reduce-overhead and max-autotune). They run without CUDA graphs and their
+# speedup is measured against the matching no-CUDA-graph 02 step.
+NO_CUDAGRAPH_TWIN = {"reduce-overhead": "default", "max-autotune": "max-autotune-no-cudagraphs"}
+CUDAGRAPH_OFF_NOTE = "CUDA graphs off (capture fails with this attention path on the RTX 6000 Ada)"
 
 def known_issue(settings):
     """ text for a failed step with a known cause, or None """
@@ -112,12 +119,13 @@ def build_plan(models, dry_run):
         plan.append(Step(f"04_profile_{m}_best", "profile", m, mode="@best", fp8_recipe="@best"))
     for m in models:
         for b in ("cudnn", "efficient"): # flash is the default backend (step 02 default)
-            plan.append(Step(f"05_sdpa_{m}_{b}", "time", m, mode="@best", fp8_recipe="@best", sdpa=b))
+            plan.append(Step(f"05_sdpa_{m}_{b}", "time", m, mode="@best", fp8_recipe="@best", sdpa=b,
+                             no_cudagraphs=True))
         plan.append(Step(f"05_patch_linear_{m}", "time", m, mode="@best", fp8_recipe="@best", kern="patch_linear",
                          requires=["config:kern_patch_linear"]))
         for v in ("gqa", "flex"):
             plan.append(Step(f"05_attn_fused_{v}_{m}", "time", m, mode="@best", fp8_recipe="@best",
-                             kern=f"attn_fused={v}", requires=["config:kern_attn_fused"]))
+                             kern=f"attn_fused={v}", requires=["config:kern_attn_fused"], no_cudagraphs=v == "flex"))
     for m in models:
         for d in ("synthetic", "real"):
             plan.append(Step(f"06_data_{m}_{d}", "time", m, mode="@best", fp8_recipe="@best", data=d,
@@ -194,6 +202,9 @@ def resolve(step, results):
         s.update(mode=mode, coord_descent=cd, best_from=k)
     if s["fp8_recipe"] and "fp8" not in s["flags"].split(","):
         s["flags"] += ",fp8"
+    if step.no_cudagraphs and s["mode"] in NO_CUDAGRAPH_TWIN:
+        s["cudagraphs_off_from"] = s["mode"]
+        s["mode"] = NO_CUDAGRAPH_TWIN[s["mode"]]
     return s
 
 # ---------------------------------------------------------------- snapshots
@@ -504,16 +515,20 @@ def vs_vanilla(step, rec, results):
     return loss, rel, speed, flagged
 
 def summary_rows(plan, results, states):
-    """ one row per step: [id, status, model, settings, ms/step, img/s, peak GiB, speedup (vs 02 default), run s,
-    note, loss, loss_vs_vanilla, speedup_vs_vanilla, loss_flagged] """
+    """ one row per step: [id, status, model, settings, ms/step, img/s, peak GiB, speedup (vs 02 default, or for a step
+    run without CUDA graphs vs the matching no-CUDA-graph 02 step), run s, note, loss, loss_vs_vanilla,
+    speedup_vs_vanilla, loss_flagged] """
     rows = []
     for step in plan:
         rec = results.get(step.id)
         state, detail = states.get(step.id, ("", ""))
         if rec:
             r, s = rec.get("result") or {}, rec.get("settings") or {}
-            base = results.get(f"02_compile_{step.model}_default")
-            speed = (ms(base) / r["ms_per_step_median"]) if (base and ms(base) and r.get("ms_per_step_median")) else None
+            base_id = f"02_compile_{step.model}_default"
+            if s.get("cudagraphs_off_from"): # compare like with like: the same mode without CUDA graphs
+                base_id = f"02_compile_{step.model}_{s['mode']}" + ("+cd" if s.get("coord_descent") else "")
+            base = results.get(base_id)
+            speed = (ms(base) / r["ms_per_step_median"]) if (finite_ok(base) and ms(base) and r.get("ms_per_step_median")) else None
             setting = "" if step.kind == "preflight" else (
                 ("no Tier 1 flags, " if s.get("flags") in ("", "none") else "")
                 + f"{s.get('mode')}{' +cd' if s.get('coord_descent') else ''}"
@@ -531,6 +546,9 @@ def summary_rows(plan, results, states):
                 note = ("loss finite" if r.get("loss_all_finite") else "LOSS NOT FINITE") if r else ""
                 if s.get("mode") in ("reduce-overhead", "max-autotune"): # CUDA graph pools are allocated before the
                     note += "; peak GiB excludes CUDA-graph memory" # timed steps reset the peak counter
+                if s.get("cudagraphs_off_from"):
+                    note += (f"; {CUDAGRAPH_OFF_NOTE}, best mode {s['cudagraphs_off_from']}: speedup vs {base_id}"
+                             + ("" if base else " (not run)"))
             rows.append([step.id, "ok" if state != "done" else "ok (earlier run)", step.model, setting,
                          r.get("ms_per_step_median") if step.kind == "time" else (r.get("gpu_span_ms_per_step") if step.kind == "profile" else None),
                          r.get("imgs_per_sec"), r.get("peak_mem_gib"), speed, rec.get("duration_s"), note,
@@ -554,7 +572,8 @@ def summary_markdown(rows, hw, args, rr, elapsed):
              "Speedup: vs `02_compile_<model>_default` (all Tier 1 flags, default compile). "
              "loss: final step's loss. vs vanilla: against `00_vanilla_<model>` (no Tier 1 flags, default compile; "
              f"same batch, steps and seed); a loss difference above {LOSS_TOL:.0%} ({LOSS_TOL_FP8:.0%} for FP8) is "
-             "marked FLAG. n/a: not a timed step, or no successful vanilla step.", "",
+             "marked FLAG. n/a: not a timed step, or no successful vanilla step. Rows run without CUDA graphs (see note) "
+             "compare speedup with the matching no-CUDA-graph 02 step.", "",
              "| step | status | model | settings | ms/step | img/s | peak GiB | speedup | speedup vs vanilla | loss "
              "| loss vs vanilla | run s | note |",
              "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
